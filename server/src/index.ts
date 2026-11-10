@@ -119,7 +119,7 @@ app.get('/api/metadata/match/:id',{preHandler:requireAuth},async(req:any,reply)=
   confidence,match_status AS matchStatus,explanations,candidates,season,episode,proposed_rel AS proposedRel,error,
   manual_correction AS manualCorrection,updated_at AS updatedAt
   FROM metadata_matches WHERE run_id=? AND inventory_id IN (SELECT id FROM inventory) ORDER BY rel LIMIT 2000`).all(id);
- return {run,matches:matches.map((row:any)=>({...row,explanations:JSON.parse(row.explanations),candidates:JSON.parse(row.candidates)}))};
+ return {run,matches:matches.map((row:any)=>({...row,manualCorrection:Boolean(row.manualCorrection),explanations:JSON.parse(row.explanations),candidates:JSON.parse(row.candidates)}))};
 });
 app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  const runId=Number(req.params?.runId);
@@ -203,7 +203,7 @@ app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,r
   manual_correction AS manualCorrection,updated_at AS updatedAt
   FROM metadata_matches WHERE run_id=? AND inventory_id=?`).get(runId,inventoryId) as any;
  const updatedRun=db.prepare('SELECT * FROM metadata_match_runs WHERE id=?').get(runId);
- return {run:updatedRun,match:{...updated,explanations:JSON.parse(updated.explanations),candidates:JSON.parse(updated.candidates)}};
+ return {run:updatedRun,match:{...updated,manualCorrection:Boolean(updated.manualCorrection),explanations:JSON.parse(updated.explanations),candidates:JSON.parse(updated.candidates)}};
 });
 
 const videoExt=new Set(['.mkv','.mp4','.avi','.m4v','.mov','.webm']);

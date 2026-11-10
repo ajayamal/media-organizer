@@ -351,6 +351,7 @@ export class MetadataMatcher {
       .run({
         runId,
         ...record,
+        manualCorrection: record.manualCorrection ? 1 : 0,
         explanations: JSON.stringify(record.explanations),
         candidates: JSON.stringify(record.candidates),
       });
