@@ -38,7 +38,7 @@ function auth(req:any){
  return !!found && found.expires>Date.now();
 }
 async function requireAuth(req:any,reply:any){if(!auth(req)) return reply.code(401).send({error:'Sign in required'});}
-function requireOrigin(req:any,reply:any){
+async function requireOrigin(req:any,reply:any){
  const origin=req.headers.origin;
  const host=req.headers.host;
  if(origin){try{if(new URL(origin).host!==host) return reply.code(403).send({error:'Invalid origin'});}catch{return reply.code(403).send({error:'Invalid origin'});}}
