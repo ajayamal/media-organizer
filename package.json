@@ -1,0 +1,1 @@
+{"name":"media-organizer","private":true,"scripts":{"build":"npm --prefix web run build && npm --prefix server run build"}}

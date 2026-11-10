@@ -1,0 +1,26 @@
+# Build image on the Ubuntu host first: docker build -t media-organizer:local .
+# Portainer: Stacks > Add stack > Web editor > paste this file.
+services:
+  organizer:
+    image: media-organizer:local
+    container_name: media-organizer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3100:3100"
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ENABLE_WRITES: "false"
+      COOKIE_SECURE: "false"
+      MEDIA_ROOT: /media
+      DATA_DIR: /app/data
+    volumes:
+      - /srv/data/movies:/media/movies:ro
+      - /srv/data/shows:/media/shows:ro
+      - organizer-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+volumes:
+  organizer-data:

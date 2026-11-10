@@ -1,0 +1,10 @@
+# Opt-in override. Use ONLY after reviewing read-only previews and taking a backup.
+# Requires host user/group permissions to rename media; see README.
+services:
+  organizer:
+    environment:
+      ENABLE_WRITES: "true"
+    volumes:
+      - /srv/data/movies:/media/movies:rw
+      - /srv/data/shows:/media/shows:rw
+      - organizer-data:/app/data
