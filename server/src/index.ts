@@ -7,12 +7,15 @@ import { promises as fs, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MetadataMatcher } from './services/metadata-matcher.js';
+import { FileAudit } from './services/file-audit.js';
 import { TmdbClient } from './services/tmdb.js';
 import { createMetadataProposal, parseMediaPath, safeMetadataName } from './services/metadata-matching.js';
 
 const ROOT = path.resolve(process.env.MEDIA_ROOT || '/media');
 const DATA = path.resolve(process.env.DATA_DIR || '/app/data');
 const WRITE_ENABLED = process.env.ENABLE_WRITES === 'true';
+const videoExt=new Set(['.mkv','.mp4','.avi','.m4v','.mov','.webm']);
+const categories=['movies/Anime','movies/Movies','shows/Anime','shows/Tv Shows'];
 const PASSWORD = process.env.ADMIN_PASSWORD || '';
 if (PASSWORD.length < 16) throw new Error('ADMIN_PASSWORD must contain at least 16 characters');
 await fs.mkdir(DATA, {recursive:true});
@@ -41,7 +44,19 @@ CREATE TABLE IF NOT EXISTS metadata_corrections (
  provider_title TEXT NOT NULL, original_title TEXT NOT NULL, provider_year INTEGER, corrected_title TEXT NOT NULL,
  corrected_year INTEGER, aliases TEXT NOT NULL, candidate_set TEXT NOT NULL DEFAULT '[]', season INTEGER, episode INTEGER,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-);`);
+);
+CREATE TABLE IF NOT EXISTS file_audit_runs (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL, total INTEGER NOT NULL DEFAULT 0,
+ processed INTEGER NOT NULL DEFAULT 0, duplicate_groups INTEGER NOT NULL DEFAULT 0, duplicate_files INTEGER NOT NULL DEFAULT 0,
+ media_related_files INTEGER NOT NULL DEFAULT 0, other_files INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
+ error TEXT, started_at TEXT NOT NULL, completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS file_audit_files (
+ run_id INTEGER NOT NULL, rel TEXT NOT NULL, category TEXT NOT NULL, extension TEXT NOT NULL, kind TEXT NOT NULL,
+ bytes INTEGER NOT NULL, sha256 TEXT, error TEXT, PRIMARY KEY (run_id,rel)
+);
+CREATE INDEX IF NOT EXISTS idx_file_audit_hash ON file_audit_files(run_id,sha256);
+CREATE INDEX IF NOT EXISTS idx_file_audit_kind ON file_audit_files(run_id,kind,rel);`);
 const matchColumns=db.prepare('PRAGMA table_info(metadata_matches)').all() as Array<{name:string}>;
 if(!matchColumns.some(column=>column.name==='manual_correction'))db.exec('ALTER TABLE metadata_matches ADD COLUMN manual_correction INTEGER NOT NULL DEFAULT 0');
 if(!matchColumns.some(column=>column.name==='episode_title'))db.exec('ALTER TABLE metadata_matches ADD COLUMN episode_title TEXT');
@@ -49,9 +64,12 @@ const correctionColumns=db.prepare('PRAGMA table_info(metadata_corrections)').al
 if(!correctionColumns.some(column=>column.name==='candidate_set'))db.exec("ALTER TABLE metadata_corrections ADD COLUMN candidate_set TEXT NOT NULL DEFAULT '[]'");
 db.prepare("UPDATE metadata_match_runs SET status='failed',error='Server restarted before matching completed.',completed_at=? WHERE status IN ('queued','running')")
  .run(new Date().toISOString());
+db.prepare("UPDATE file_audit_runs SET status='failed',error='Server restarted before the file audit completed.',completed_at=? WHERE status IN ('queued','running')")
+ .run(new Date().toISOString());
 const app = Fastify({logger:true, bodyLimit:64*1024, trustProxy:false});
 await app.register(cookie);
 const metadataMatcher = new MetadataMatcher(db, process.env.TMDB_READ_TOKEN || '');
+const fileAudit = new FileAudit(db, ROOT, categories);
 const tmdbClient = new TmdbClient(db, process.env.TMDB_READ_TOKEN || '');
 app.addHook('onRequest', async (req, reply) => {
   reply.header('X-Content-Type-Options','nosniff');
@@ -206,9 +224,7 @@ app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,r
  return {run:updatedRun,match:{...updated,manualCorrection:Boolean(updated.manualCorrection),explanations:JSON.parse(updated.explanations),candidates:JSON.parse(updated.candidates)}};
 });
 
-const videoExt=new Set(['.mkv','.mp4','.avi','.m4v','.mov','.webm']);
 const extraNames=/^(extras?|specials?|featurettes?|behind the scenes)$/i;
-const categories=['movies/Anime','movies/Movies','shows/Anime','shows/Tv Shows'];
 function normalizeName(s:string){return s.replace(/[._]+/g,' ').replace(/\s+/g,' ').trim();}
 function suggest(rel:string):{proposal:string|null,issue:string,confidence:string}{
  const parts=rel.split('/');const base=parts.at(-1)!;const stem=base.slice(0,-path.extname(base).length);const ext=path.extname(base);
@@ -278,8 +294,51 @@ async function verifiedPath(rel:string){
  return full;
 }
 let scanning=false;
+let auditing=false;
+app.post('/api/audit',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
+ if(scanning||auditing)return reply.code(409).send({error:'A library scan or file audit is already running.'});
+ const startedAt=new Date().toISOString();
+ const info=db.prepare("INSERT INTO file_audit_runs (status,started_at) VALUES ('queued',?)").run(startedAt);
+ const runId=Number(info.lastInsertRowid);
+ db.prepare(`DELETE FROM file_audit_files WHERE run_id IN (
+  SELECT id FROM file_audit_runs WHERE id NOT IN (SELECT id FROM file_audit_runs ORDER BY id DESC LIMIT 5)
+ )`).run();
+ db.prepare('DELETE FROM file_audit_runs WHERE id NOT IN (SELECT id FROM file_audit_runs ORDER BY id DESC LIMIT 5)').run();
+ auditing=true;
+ setImmediate(()=>{
+  void fileAudit.run(runId).catch(error=>{
+   const message=error instanceof Error?error.message:'Unknown file audit failure.';
+   app.log.error({err:error,runId},'File audit failed');
+   fileAudit.fail(runId,message);
+  }).finally(()=>{auditing=false;});
+ });
+ return reply.code(202).send({runId,status:'queued'});
+});
+app.get('/api/audit/:id',{preHandler:requireAuth},async(req:any,reply)=>{
+ const id=Number(req.params?.id);
+ if(!Number.isSafeInteger(id)||id<1)return reply.code(400).send({error:'Invalid file audit run id.'});
+ const run=db.prepare('SELECT * FROM file_audit_runs WHERE id=?').get(id) as any;
+ if(!run)return reply.code(404).send({error:'File audit run not found.'});
+ if(run.status!=='completed')return {run,duplicateGroups:[],mediaRelatedFiles:[],otherTypes:[],hashErrors:[]};
+ const duplicateGroups=db.prepare(`SELECT sha256 AS hash,MIN(bytes) AS bytes,COUNT(*) AS count
+  FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL GROUP BY sha256 HAVING COUNT(*)>1
+  ORDER BY bytes DESC,hash LIMIT 500`).all(id) as Array<{hash:string,bytes:number,count:number}>;
+ const duplicates=db.prepare(`SELECT rel,category,kind,bytes,sha256 AS hash FROM file_audit_files
+  WHERE run_id=? AND sha256 IN (SELECT sha256 FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL
+   GROUP BY sha256 HAVING COUNT(*)>1 ORDER BY MIN(bytes) DESC,sha256 LIMIT 500)
+  ORDER BY sha256,rel LIMIT 5000`).all(id,id) as Array<{rel:string,category:string,kind:string,bytes:number,hash:string}>;
+ const duplicateMap=new Map<string,{hash:string,bytes:number,count:number,files:Array<{rel:string,category:string,kind:string}>}>();
+ for(const group of duplicateGroups)duplicateMap.set(group.hash,{...group,files:[]});
+ for(const file of duplicates)duplicateMap.get(file.hash)?.files.push({rel:file.rel,category:file.category,kind:file.kind});
+ const mediaRelatedFiles=db.prepare(`SELECT rel,category,extension,kind,bytes,error FROM file_audit_files
+  WHERE run_id=? AND kind IN ('subtitle','artwork','metadata','archive') ORDER BY kind,rel LIMIT 2000`).all(id);
+ const otherTypes=db.prepare(`SELECT extension,COUNT(*) AS count,COALESCE(SUM(bytes),0) AS bytes FROM file_audit_files
+  WHERE run_id=? AND kind='other' GROUP BY extension ORDER BY count DESC,extension`).all(id);
+ const hashErrors=db.prepare('SELECT rel,error FROM file_audit_files WHERE run_id=? AND error IS NOT NULL ORDER BY rel LIMIT 200').all(id);
+ return {run,duplicateGroups:[...duplicateMap.values()],mediaRelatedFiles,otherTypes,hashErrors};
+});
 app.post('/api/scan',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
- if(scanning)return reply.code(409).send({error:'Scan already running'});
+ if(scanning||auditing)return reply.code(409).send({error:'A library scan or file audit is already running.'});
  scanning=true;
  try{
   const rows:Array<{id:string,rel:string,bytes:number,category:string,issue:string,proposal:string|null,confidence:string,scanned_at:string}>=[];

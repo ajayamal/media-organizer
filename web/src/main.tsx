@@ -3,7 +3,9 @@ import { createRoot } from 'react-dom/client';
 import {
   AlertTriangle,
   Check,
+  Copy,
   Database,
+  Files,
   Film,
   FolderOpen,
   HardDrive,
@@ -84,8 +86,43 @@ type MatchRun = {
   completed_at: string | null;
 };
 
-type Tab = 'library' | 'metadata' | 'history';
+type Tab = 'library' | 'audit' | 'metadata' | 'history';
 type MatchFilter = 'all' | 'review' | 'high' | 'medium' | 'low' | 'unmatched' | 'preserved';
+
+type AuditRun = {
+  id: number;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  total: number;
+  processed: number;
+  duplicate_groups: number;
+  duplicate_files: number;
+  media_related_files: number;
+  other_files: number;
+  errors: number;
+  error: string | null;
+  started_at: string;
+  completed_at: string | null;
+};
+
+type AuditReport = {
+  run: AuditRun;
+  duplicateGroups: Array<{
+    hash: string;
+    bytes: number;
+    count: number;
+    files: Array<{ rel: string; category: string; kind: string }>;
+  }>;
+  mediaRelatedFiles: Array<{
+    rel: string;
+    category: string;
+    extension: string;
+    kind: string;
+    bytes: number;
+    error: string | null;
+  }>;
+  otherTypes: Array<{ extension: string; count: number; bytes: number }>;
+  hashErrors: Array<{ rel: string; error: string }>;
+};
 
 type MetadataGroup = {
   key: string;
@@ -112,6 +149,11 @@ function getStoredRunId(): number | null {
   return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
+function getStoredAuditId(): number | null {
+  const value = Number(window.sessionStorage.getItem('media-organizer-audit-run'));
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
 function App() {
   const [authed, setAuthed] = useState(false);
   const [password, setPassword] = useState('');
@@ -129,6 +171,11 @@ function App() {
   const [matchRunId, setMatchRunId] = useState<number | null>(getStoredRunId);
   const [matchRun, setMatchRun] = useState<MatchRun | null>(null);
   const [matches, setMatches] = useState<MetadataMatch[]>([]);
+  const [auditRunId, setAuditRunId] = useState<number | null>(getStoredAuditId);
+  const [auditReport, setAuditReport] = useState<AuditReport | null>(null);
+  const [auditBusy, setAuditBusy] = useState(false);
+  const [auditError, setAuditError] = useState('');
+  const [auditQuery, setAuditQuery] = useState('');
 
   const load = async () => {
     const [inventory, history] = await Promise.all([
@@ -170,6 +217,27 @@ function App() {
       window.clearInterval(interval);
     };
   }, [authed, matchRunId, matchRun?.status]);
+
+  useEffect(() => {
+    if (!authed || auditRunId === null || auditReport?.run.status === 'completed' || auditReport?.run.status === 'failed') return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const result = await api<AuditReport>(`/audit/${auditRunId}`);
+        if (!active) return;
+        setAuditReport(result);
+        setAuditError('');
+      } catch (error) {
+        if (active) setAuditError(error instanceof Error ? error.message : 'Unable to load file audit results.');
+      }
+    };
+    void poll();
+    const interval = window.setInterval(() => void poll(), 1500);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [authed, auditRunId, auditReport?.run.status]);
 
   const run = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -228,6 +296,40 @@ function App() {
     }
   };
 
+  const startAudit = async () => {
+    setAuditBusy(true);
+    setAuditError('');
+    try {
+      const result = await api<{ runId: number; status: AuditRun['status'] }>('/audit', 'POST');
+      window.sessionStorage.setItem('media-organizer-audit-run', String(result.runId));
+      setAuditRunId(result.runId);
+      setAuditReport({
+        run: {
+          id: result.runId,
+          status: result.status,
+          total: 0,
+          processed: 0,
+          duplicate_groups: 0,
+          duplicate_files: 0,
+          media_related_files: 0,
+          other_files: 0,
+          errors: 0,
+          error: null,
+          started_at: new Date().toISOString(),
+          completed_at: null,
+        },
+        duplicateGroups: [],
+        mediaRelatedFiles: [],
+        otherTypes: [],
+        hashErrors: [],
+      });
+    } catch (error) {
+      setAuditError(error instanceof Error ? error.message : 'Unable to start the file audit.');
+    } finally {
+      setAuditBusy(false);
+    }
+  };
+
   const saveCorrection = async (
     match: MetadataMatch,
     correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
@@ -260,7 +362,10 @@ function App() {
     setMatchRunId(null);
     setMatchRun(null);
     setMatches([]);
+    setAuditRunId(null);
+    setAuditReport(null);
     window.sessionStorage.removeItem('media-organizer-metadata-run');
+    window.sessionStorage.removeItem('media-organizer-audit-run');
   });
 
   const visible = items.filter(item =>
@@ -308,6 +413,7 @@ function App() {
         </div>
         <nav>
           <button className={tab === 'library' ? 'active' : ''} onClick={() => setTab('library')}><FolderOpen size={18} />Library</button>
+          <button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}><Files size={18} />File audit</button>
           <button className={tab === 'metadata' ? 'active' : ''} onClick={() => setTab('metadata')}><Sparkles size={18} />Metadata matching</button>
           <button className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}><RotateCcw size={18} />Operation history</button>
         </nav>
@@ -323,14 +429,17 @@ function App() {
         <header>
           <div>
             <span className="eyebrow">MEDIA MANAGEMENT</span>
-            <h1>{tab === 'library' ? 'Your media library' : tab === 'metadata' ? 'Metadata matching' : 'Operation history'}</h1>
+            <h1>{tab === 'library' ? 'Your media library' : tab === 'audit' ? 'File audit' : tab === 'metadata' ? 'Metadata matching' : 'Operation history'}</h1>
             <p>{tab === 'library'
               ? 'Scan, review, and organize your existing files safely.'
-              : tab === 'metadata'
-                ? 'Find provider matches and review safe rename proposals.'
-                : 'Review applied changes and undo eligible renames.'}</p>
+              : tab === 'audit'
+                ? 'Find exact duplicate files and review media-related files without changing anything.'
+                : tab === 'metadata'
+                  ? 'Find provider matches and review safe rename proposals.'
+                  : 'Review applied changes and undo eligible renames.'}</p>
           </div>
           {tab === 'library' && <button className="primary" disabled={busy} onClick={scan}><RefreshCw size={16} />{busy ? 'Working...' : 'Scan library'}</button>}
+          {tab === 'audit' && <button className="primary" disabled={auditBusy || auditReport?.run.status === 'queued' || auditReport?.run.status === 'running'} onClick={startAudit}><RefreshCw size={16} />{auditBusy ? 'Starting...' : auditReport ? 'Run audit again' : 'Start file audit'}</button>}
         </header>
 
         {msg && <div className="notice"><AlertTriangle size={16} />{msg}<button onClick={() => setMsg('')}>×</button></div>}
@@ -390,6 +499,15 @@ function App() {
           />
         )}
 
+        {tab === 'audit' && (
+          <FileAuditPanel
+            report={auditReport}
+            error={auditError}
+            query={auditQuery}
+            onQuery={setAuditQuery}
+          />
+        )}
+
         {tab === 'history' && (
           <section className="panel">
             <div className="panel-top"><div><h2>Rename journal</h2><p>Only operations performed by this application are shown.</p></div></div>
@@ -409,7 +527,9 @@ function App() {
           </section>
         )}
 
-        <div className="footnote"><ShieldCheck size={15} />Only video files are scanned. Extras and AppleDouble files are flagged or preserved. Subtitles are never deleted.</div>
+        <div className="footnote"><ShieldCheck size={15} />{tab === 'audit'
+          ? 'File audits are read-only. Exact duplicate groups are SHA-256 verified; files are never moved or deleted.'
+          : 'Only video files are scanned for rename suggestions. Extras and AppleDouble files are preserved; subtitles are never deleted.'}</div>
       </main>
     </div>
   );
@@ -435,6 +555,156 @@ function groupMatches(matches: MetadataMatch[]): MetadataGroup[] {
     group.matches.push(match);
   }
   return [...grouped.values()].sort((a, b) => a.title.localeCompare(b.title));
+}
+
+function FileAuditPanel({
+  report,
+  error,
+  query,
+  onQuery,
+}: {
+  report: AuditReport | null;
+  error: string;
+  query: string;
+  onQuery: (value: string) => void;
+}) {
+  if (!report) {
+    return (
+      <>
+        <section className="metadata-intro panel">
+          <div className="metadata-intro-icon"><Copy size={21} /></div>
+          <div className="metadata-intro-copy">
+            <h2>Read-only duplicate and file inventory</h2>
+            <p>SHA-256 hashes are computed only for files sharing a size, then compared exactly. Common subtitles, artwork, metadata, and archives are listed; other file types are summarized by extension.</p>
+          </div>
+        </section>
+        {error && <div className="notice"><AlertTriangle size={16} />{error}</div>}
+        <div className="empty panel-empty">Start an audit to scan files in the configured media folders.</div>
+      </>
+    );
+  }
+
+  const { run } = report;
+  const active = run.status === 'queued' || run.status === 'running';
+  const progress = run.total > 0
+    ? Math.min(100, Math.round(run.processed / run.total * 100))
+    : run.status === 'completed' ? 100 : 0;
+  const visibleMediaFiles = report.mediaRelatedFiles.filter(file =>
+    `${file.rel} ${file.kind} ${file.extension}`.toLowerCase().includes(query.toLowerCase()),
+  );
+  const visibleDuplicateGroups = report.duplicateGroups.filter(group =>
+    group.files.some(file => `${file.rel} ${file.kind}`.toLowerCase().includes(query.toLowerCase())),
+  );
+
+  return (
+    <>
+      {error && <div className="notice"><AlertTriangle size={16} />{error}</div>}
+      <section className="match-progress panel">
+        <div className="match-progress-heading">
+          <div><span className="eyebrow">AUDIT #{run.id}</span><h2>{auditStatusLabel(run.status)}</h2></div>
+          {active && run.total > 0 && <span className="progress-percent">{progress}%</span>}
+        </div>
+        <div className="progress-track"><div className="progress-value" style={{ width: `${progress}%` }} /></div>
+        <div className="progress-summary">
+          <span>{active && run.total === 0 ? 'Scanning file paths…' : `${run.processed.toLocaleString()} of ${run.total.toLocaleString()} files checked`}</span>
+          {run.completed_at && <span>Completed {new Date(run.completed_at).toLocaleString()}</span>}
+        </div>
+        {run.error && <p className="error-text">{run.error}</p>}
+        <div className="match-stats">
+          <div><strong>{run.duplicate_groups.toLocaleString()}</strong><span>Exact duplicate groups</span></div>
+          <div><strong>{run.duplicate_files.toLocaleString()}</strong><span>Files in duplicate groups</span></div>
+          <div><strong>{run.media_related_files.toLocaleString()}</strong><span>Non-video media files</span></div>
+          <div><strong>{run.other_files.toLocaleString()}</strong><span>Other file types</span></div>
+        </div>
+        {run.errors > 0 && <p className="match-note">{run.errors} candidate file(s) could not be hashed because they changed or became inaccessible.</p>}
+      </section>
+
+      <section className="panel audit-results">
+        <div className="panel-top metadata-results-top">
+          <div><h2>Audit details</h2><p>Duplicate candidates are compared by exact SHA-256 content. Search filters duplicate paths and listed media-related files.</p></div>
+          <div className="search"><Search size={16} /><input value={query} onChange={event => onQuery(event.target.value)} placeholder="Search audit results..." /></div>
+        </div>
+
+        <section className="audit-section">
+          <h3>Exact duplicate groups <span>{run.duplicate_groups.toLocaleString()}</span></h3>
+          {active
+            ? <div className="empty audit-empty">Duplicate groups will be available when hashing is complete.</div>
+            : visibleDuplicateGroups.length === 0
+              ? <div className="empty audit-empty">{run.duplicate_groups === 0 ? 'No exact duplicates found.' : 'No duplicate paths match your search.'}</div>
+              : <div className="audit-list">
+              {visibleDuplicateGroups.map(group => (
+                <details className="audit-group" key={group.hash}>
+                  <summary><strong>{group.count} identical files</strong><span>{formatBytes(group.bytes)} each</span></summary>
+                  <ul>{group.files.map(file => <li key={file.rel}><code>{file.rel}</code><span>{file.kind}</span></li>)}</ul>
+                  {group.files.length < group.count && <p className="audit-limit">Showing {group.files.length.toLocaleString()} of {group.count.toLocaleString()} identical paths.</p>}
+                </details>
+              ))}
+              {run.duplicate_groups > report.duplicateGroups.length && <p className="audit-limit">Showing the first {report.duplicateGroups.length} duplicate groups.</p>}
+            </div>}
+        </section>
+
+        <section className="audit-section">
+          <h3>Media-related non-video files <span>{run.media_related_files.toLocaleString()}</span></h3>
+          {active
+            ? <div className="empty audit-empty">File inventory will be available when the audit completes.</div>
+            : visibleMediaFiles.length === 0
+              ? <div className="empty audit-empty">{run.media_related_files === 0 ? 'No subtitles, artwork, metadata, or archives found.' : 'No files match your search.'}</div>
+            : <div className="table-wrap">
+              <table>
+                <thead><tr><th>Path</th><th>Type</th><th>Size</th></tr></thead>
+                <tbody>{visibleMediaFiles.map(file => (
+                  <tr key={file.rel}><td className="file-path">{file.rel}</td><td>{file.kind} · {file.extension}</td><td>{formatBytes(file.bytes)}</td></tr>
+                ))}</tbody>
+              </table>
+              {run.media_related_files > report.mediaRelatedFiles.length && <p className="audit-limit">Showing {report.mediaRelatedFiles.length.toLocaleString()} of {run.media_related_files.toLocaleString()} media-related files.</p>}
+            </div>}
+        </section>
+
+        <section className="audit-section">
+          <h3>Other file types <span>{run.other_files.toLocaleString()}</span></h3>
+          {active
+            ? <div className="empty audit-empty">Extension counts will be available when the audit completes.</div>
+            : report.otherTypes.length === 0
+              ? <div className="empty audit-empty">No unclassified file types found.</div>
+            : <div className="table-wrap">
+              <table>
+                <thead><tr><th>Extension</th><th>Files</th><th>Total size</th></tr></thead>
+                <tbody>{report.otherTypes.map(type => (
+                  <tr key={type.extension}><td>{type.extension}</td><td>{type.count.toLocaleString()}</td><td>{formatBytes(type.bytes)}</td></tr>
+                ))}</tbody>
+              </table>
+            </div>}
+        </section>
+        {run.errors > 0 && (
+          <section className="audit-section">
+            <h3>Files not verified <span>{run.errors.toLocaleString()}</span></h3>
+            <ul className="audit-errors">{report.hashErrors.map(file => <li key={file.rel}><code>{file.rel}</code><span>{file.error}</span></li>)}</ul>
+            {run.errors > report.hashErrors.length && <p className="audit-limit">Showing {report.hashErrors.length.toLocaleString()} of {run.errors.toLocaleString()} hash errors.</p>}
+          </section>
+        )}
+        <footer>Read-only audit · No files are modified</footer>
+      </section>
+    </>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = -1;
+  do {
+    value /= 1024;
+    unit++;
+  } while (value >= 1024 && unit < units.length - 1);
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function auditStatusLabel(status: AuditRun['status']): string {
+  if (status === 'queued') return 'Audit queued';
+  if (status === 'running') return 'Audit in progress';
+  if (status === 'failed') return 'Audit failed';
+  return 'Audit complete';
 }
 
 function MetadataPanel({

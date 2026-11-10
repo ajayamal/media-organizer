@@ -10,7 +10,9 @@ A self-hosted React + TypeScript dashboard, Fastify API, SQLite inventory and re
 - **TMDB matching is read-only.** It stores provider candidates, score explanations, and possible destinations in SQLite; it never changes media files. Matching results are not wired to a batch execution UI yet.
 - **Collision protection:** exclusive hard-link creation prevents overwriting a destination. Moves remain within the same underlying filesystem; the app rejects cross-filesystem hard links.
 - **Undo:** records successful operations in SQLite; undo fails safely if the old name is occupied or the renamed file is missing. A process crash between filesystem change and journal write can leave an unjournaled rename, so this is **best-effort rollback, not transactional backup**.
-- **File scanning:** recursively enumerates video extensions, excludes symlink entries, skips macOS `._` metadata proposals. Scan replaces the current inventory snapshot but preserves operation history.
+- **File scanning:** the library scan recursively indexes video extensions and excludes symlink entries. The separate read-only File audit scans regular files in the configured media folders, skips symlinks, and never modifies files.
+- **Duplicate detection:** the File audit first groups files by size, then streams SHA-256 only for files in repeated-size groups. Only identical hashes are reported as duplicates. Files changing during hashing are reported as errors and are not treated as verified duplicates.
+- **Non-video inventory:** subtitles, artwork, metadata sidecars, and archives are listed. Other extensions are summarized by extension and count. macOS `._` files are included in audit results but remain preserved by the rename workflow.
 - **Security:** password login (scrypt), HTTP-only SameSite=Strict cookie, same-origin checks for writes, no Docker socket, no public port binding. No TLS built into app: use SSH tunnel or private HTTPS reverse proxy. No built-in login rate limiting; restrict access to trusted networks. Password must be >=16 characters.
 - **Not production-hardened against malicious local users who can mutate the same folders concurrently.** Use a dedicated trusted server and avoid concurrent renames from other programs.
 - **Folder renaming:** this version can create standardized movie/season folders; empty old folders are not removed automatically.
@@ -42,6 +44,8 @@ ssh -L 3100:127.0.0.1:3100 sillygooze@YOUR_SERVER_LAN_IP
 Keep the SSH session open, then visit `http://localhost:3100` on that PC. This keeps the app off your public/LAN interfaces. You can alternatively use a trusted private HTTPS reverse proxy with access controls; set `COOKIE_SECURE=true` when the browser connects over HTTPS.
 
 Click **Scan library**, review results. Scanning may take some time on large collections.
+
+Use **File audit** to run a separate read-only scan. It compares exact file contents for same-size candidates using SHA-256, lists common media sidecars (such as subtitles, artwork, metadata, and archives), and summarizes other extensions. Responses include up to 500 duplicate groups, 5,000 duplicate paths, and 2,000 non-video files; summary counts include the full scan.
 
 ## Portainer deployment
 
@@ -88,6 +92,8 @@ In the existing stack editor, explicitly change **both** media volume modes from
 - `POST /api/login` — password login
 - `POST /api/logout` — logout
 - `POST /api/scan` — scan library (authenticated)
+- `POST /api/audit` — start an asynchronous read-only duplicate and non-video file audit (authenticated)
+- `GET /api/audit/:id` — get audit progress, exact duplicate groups, media-related files, and other-extension counts (authenticated)
 - `POST /api/metadata/match` — start an asynchronous metadata-matching run (requires `TMDB_READ_TOKEN`)
 - `GET /api/metadata/match/:id` — get run progress and its matching results (authenticated)
 - `GET /api/inventory` — inventory and proposals
@@ -119,4 +125,4 @@ Vite runs on port 5173 and proxies `/api` to Fastify port 3100. Use only on a tr
 
 ## What to add next
 
-Frontend matching dashboard, review corrections, dry-run batch preview, and safe grouped rename execution remain future work. This MVP does not perform them automatically.
+Dry-run batch preview and safe grouped rename execution remain future work. File auditing and metadata corrections are read-only and do not perform automatic changes.
