@@ -7,7 +7,7 @@ A self-hosted React + TypeScript dashboard, Fastify API, SQLite inventory and re
 - **Read-only by default:** the Docker media mounts use `:ro`, and `ENABLE_WRITES=false` independently disables changes.
 - **No deletion endpoint, no automatic bulk changes.** Each high-confidence rename requires an explicit confirmation. Ambiguous anime absolute-numbered episodes, extras, OVAs, and inconsistent season numbers are *review only*.
 - **No subtitle renaming yet.** Subtitles are left intact; do not apply a rename to a video with sidecar subtitles until this feature is added. Embedded subtitles are unaffected.
-- **No external metadata lookup yet.** Suggestions are based on path patterns, not verified against TMDB/TVDB. Inspect each preview.
+- **TMDB matching is read-only.** It stores provider candidates, score explanations, and possible destinations in SQLite; it never changes media files. Matching results are not wired to a batch execution UI yet.
 - **Collision protection:** exclusive hard-link creation prevents overwriting a destination. Moves remain within the same underlying filesystem; the app rejects cross-filesystem hard links.
 - **Undo:** records successful operations in SQLite; undo fails safely if the old name is occupied or the renamed file is missing. A process crash between filesystem change and journal write can leave an unjournaled rename, so this is **best-effort rollback, not transactional backup**.
 - **File scanning:** recursively enumerates video extensions, excludes symlink entries, skips macOS `._` metadata proposals. Scan replaces the current inventory snapshot but preserves operation history.
@@ -27,6 +27,7 @@ cd /srv/apps
 cd /srv/apps/media-organizer
 cp .env.example .env
 nano .env # Set a unique strong ADMIN_PASSWORD (>=16 characters)
+# Optionally set TMDB_READ_TOKEN to enable server-side metadata matching.
 chmod 600 .env
 docker compose up -d --build
 docker compose logs -f organizer
@@ -87,12 +88,24 @@ In the existing stack editor, explicitly change **both** media volume modes from
 - `POST /api/login` — password login
 - `POST /api/logout` — logout
 - `POST /api/scan` — scan library (authenticated)
+- `POST /api/metadata/match` — start an asynchronous metadata-matching run (requires `TMDB_READ_TOKEN`)
+- `GET /api/metadata/match/:id` — get run progress and its matching results (authenticated)
 - `GET /api/inventory` — inventory and proposals
 - `GET /api/operations` — journal
 - `POST /api/apply` — `{ "id": "<inventory-id>", "expectedProposal": "<proposed-relative-path>" }`
 - `POST /api/undo` — `{ "id": 123 }`
 
 ## Development
+
+### TMDB metadata matching
+
+Set `TMDB_READ_TOKEN` in `.env` to a TMDB API Read Access Token. The token stays on the server and is sent only to TMDB; do not put it in frontend code or commit it. If unset, the application starts normally and the matching endpoint returns a clear `503` response.
+
+After scanning, an authenticated `POST /api/metadata/match` starts a background run and returns a run ID. Poll `GET /api/metadata/match/:id` for progress, candidate titles, confidence explanations, and proposed destinations. Movie and TV searches are separate. Search, alternative-title, and season/episode responses are cached in SQLite; requests have timeouts, retries, and rate spacing.
+
+Scores are deterministic (title similarity, year evidence, and media type): 90–100 is high, 70–89 medium, and below 70 low. These are heuristic scores, not probabilities. Ambiguity, year conflicts, and episode safety checks can prevent high-confidence classification regardless of score.
+
+Episode proposals require a standard `SxxEyy` filename and a matching TMDB season/episode. Absolute anime episode numbers, specials, conflicting season folders, ambiguous candidates, and year mismatches remain in review. This phase only writes matching metadata to the app database; it never renames files.
 
 ```bash
 cd server && npm install && ADMIN_PASSWORD='replace-with-a-long-random-password' MEDIA_ROOT=/srv/data DATA_DIR=./dev-data npm run dev
@@ -104,4 +117,4 @@ Vite runs on port 5173 and proxies `/api` to Fastify port 3100. Use only on a tr
 
 ## What to add next
 
-External subtitle pairing and atomic grouped rename, manual editable proposals, TVDB/TMDB provider lookup, review queue for anime absolute numbering and Cosmos season mapping, dry-run CSV export, duplicate detection, and crash-recovery reconciliation. This MVP intentionally does not perform these automatically.
+Frontend matching dashboard, review corrections, dry-run batch preview, and safe grouped rename execution remain future work. This MVP does not perform them automatically.

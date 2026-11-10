@@ -9,6 +9,7 @@ services:
       - "127.0.0.1:3100:3100"
     environment:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      TMDB_READ_TOKEN: ${TMDB_READ_TOKEN:-}
       ENABLE_WRITES: "false"
       COOKIE_SECURE: "false"
       MEDIA_ROOT: /media

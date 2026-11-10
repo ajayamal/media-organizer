@@ -6,6 +6,7 @@ import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypt
 import { promises as fs, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MetadataMatcher } from './services/metadata-matcher.js';
 
 const ROOT = path.resolve(process.env.MEDIA_ROOT || '/media');
 const DATA = path.resolve(process.env.DATA_DIR || '/app/data');
@@ -17,9 +18,26 @@ const db = new Database(path.join(DATA,'organizer.sqlite'));
 db.pragma('journal_mode = WAL');
 db.exec(`CREATE TABLE IF NOT EXISTS inventory (id TEXT PRIMARY KEY, rel TEXT NOT NULL UNIQUE, bytes INTEGER NOT NULL, category TEXT NOT NULL, issue TEXT NOT NULL, proposal TEXT, confidence TEXT NOT NULL, scanned_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS operations (id INTEGER PRIMARY KEY AUTOINCREMENT, old_rel TEXT NOT NULL, new_rel TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, undone_at TEXT);
-CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL);`);
+CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS metadata_cache (cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS metadata_matches (
+ run_id INTEGER NOT NULL, inventory_id TEXT NOT NULL, rel TEXT NOT NULL, provider_id INTEGER, provider_type TEXT,
+ title TEXT, original_title TEXT, release_year INTEGER, episode_title TEXT, confidence_score INTEGER NOT NULL,
+ confidence TEXT NOT NULL, match_status TEXT NOT NULL, explanations TEXT NOT NULL,
+ candidates TEXT NOT NULL, season INTEGER, episode INTEGER, proposed_rel TEXT, error TEXT, updated_at TEXT NOT NULL,
+ PRIMARY KEY (run_id,inventory_id)
+);
+CREATE TABLE IF NOT EXISTS metadata_match_runs (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL, total INTEGER NOT NULL DEFAULT 0,
+ processed INTEGER NOT NULL DEFAULT 0, matched INTEGER NOT NULL DEFAULT 0, review INTEGER NOT NULL DEFAULT 0,
+ unmatched INTEGER NOT NULL DEFAULT 0, preserved INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, error TEXT,
+ started_at TEXT NOT NULL, completed_at TEXT
+);`);
+db.prepare("UPDATE metadata_match_runs SET status='failed',error='Server restarted before matching completed.',completed_at=? WHERE status IN ('queued','running')")
+ .run(new Date().toISOString());
 const app = Fastify({logger:true, bodyLimit:64*1024, trustProxy:false});
 await app.register(cookie);
+const metadataMatcher = new MetadataMatcher(db, process.env.TMDB_READ_TOKEN || '');
 app.addHook('onRequest', async (req, reply) => {
   reply.header('X-Content-Type-Options','nosniff');
   reply.header('X-Frame-Options','DENY');
@@ -59,6 +77,34 @@ app.post('/api/logout',{preHandler:[requireOrigin,requireAuth]},async(req:any,re
  reply.clearCookie('mo_session',{path:'/'});return {ok:true};
 });
 app.get('/api/status',async(req,reply)=>({authenticated:auth(req),writesEnabled:WRITE_ENABLED}));
+app.post('/api/metadata/match',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
+ if(!process.env.TMDB_READ_TOKEN?.trim())return reply.code(503).send({error:'Metadata matching is unavailable: TMDB_READ_TOKEN is not configured.'});
+ const active=db.prepare("SELECT id FROM metadata_match_runs WHERE status IN ('queued','running') LIMIT 1").get() as {id:number}|undefined;
+ if(active)return reply.code(409).send({error:'A metadata matching run is already in progress.',runId:active.id});
+ const count=(db.prepare('SELECT COUNT(*) AS count FROM inventory').get() as {count:number}).count;
+ const startedAt=new Date().toISOString();
+ const info=db.prepare("INSERT INTO metadata_match_runs (status,total,started_at) VALUES ('queued',?,?)").run(count,startedAt);
+ const runId=Number(info.lastInsertRowid);
+ setImmediate(()=>{
+  void metadataMatcher.run(runId).catch(error=>{
+   const message=error instanceof Error?error.message:'Unknown metadata matching failure.';
+   app.log.error({err:error,runId},'Metadata matching run failed');
+   metadataMatcher.fail(runId,message);
+  });
+ });
+ return reply.code(202).send({runId,status:'queued',total:count});
+});
+app.get('/api/metadata/match/:id',{preHandler:requireAuth},async(req:any,reply)=>{
+ const id=Number(req.params?.id);
+ if(!Number.isSafeInteger(id)||id<1)return reply.code(400).send({error:'Invalid metadata run id.'});
+ const run=db.prepare('SELECT * FROM metadata_match_runs WHERE id=?').get(id);
+ if(!run)return reply.code(404).send({error:'Metadata matching run not found.'});
+ const matches=db.prepare(`SELECT inventory_id AS inventoryId,rel,provider_id AS providerId,provider_type AS providerType,
+  title,original_title AS originalTitle,release_year AS releaseYear,episode_title AS episodeTitle,confidence_score AS confidenceScore,
+  confidence,match_status AS matchStatus,explanations,candidates,season,episode,proposed_rel AS proposedRel,error,updated_at AS updatedAt
+  FROM metadata_matches WHERE run_id=? AND inventory_id IN (SELECT id FROM inventory) ORDER BY rel LIMIT 2000`).all(id);
+ return {run,matches:matches.map((row:any)=>({...row,explanations:JSON.parse(row.explanations),candidates:JSON.parse(row.candidates)}))};
+});
 
 const videoExt=new Set(['.mkv','.mp4','.avi','.m4v','.mov','.webm']);
 const extraNames=/^(extras?|specials?|featurettes?|behind the scenes)$/i;
