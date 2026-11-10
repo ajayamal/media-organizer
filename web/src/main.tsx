@@ -65,6 +65,7 @@ type MetadataMatch = {
   episode: number | null;
   proposedRel: string | null;
   error: string | null;
+  manualCorrection: boolean;
   updatedAt: string;
 };
 
@@ -84,7 +85,7 @@ type MatchRun = {
 };
 
 type Tab = 'library' | 'metadata' | 'history';
-type MatchFilter = 'all' | 'high' | 'medium' | 'low' | 'unmatched' | 'preserved';
+type MatchFilter = 'all' | 'review' | 'high' | 'medium' | 'low' | 'unmatched' | 'preserved';
 
 type MetadataGroup = {
   key: string;
@@ -227,6 +228,20 @@ function App() {
     }
   };
 
+  const saveCorrection = async (
+    match: MetadataMatch,
+    correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
+  ) => {
+    if (!matchRun) throw new Error('No matching run is selected.');
+    const result = await api<{ run: MatchRun; match: MetadataMatch }>(
+      `/metadata/match/${matchRun.id}/${encodeURIComponent(match.inventoryId)}`,
+      'PATCH',
+      correction,
+    );
+    setMatchRun(result.run);
+    setMatches(current => current.map(item => item.inventoryId === result.match.inventoryId ? result.match : item));
+  };
+
   const apply = (item: Item) => {
     if (!item.proposal || !window.confirm(`Rename this file?\n\nFROM: ${item.rel}\n\nTO: ${item.proposal}\n\nNo files will be deleted.`)) return;
     void run(() => api('/apply', 'POST', { id: item.id, expectedProposal: item.proposal }));
@@ -255,7 +270,10 @@ function App() {
   const totalBytes = items.reduce((total, item) => total + item.bytes, 0);
   const high = items.filter(item => item.confidence === 'high' && item.proposal).length;
   const review = items.filter(item => item.confidence === 'review').length;
-  const filteredMatches = matches.filter(match => matchFilter === 'all' || match.confidence === matchFilter);
+  const filteredMatches = matches.filter(match =>
+    matchFilter === 'all'
+    || (matchFilter === 'review' ? match.matchStatus === 'review' : match.confidence === matchFilter),
+  );
   const groups = groupMatches(filteredMatches);
   const progress = matchRun && matchRun.total > 0
     ? Math.min(100, Math.round((matchRun.processed / matchRun.total) * 100))
@@ -365,8 +383,10 @@ function App() {
             filter={matchFilter}
             progress={progress}
             error={matchError}
+            runId={matchRun?.id ?? null}
             onStart={startMatching}
             onFilter={setMatchFilter}
+            onSaveCorrection={saveCorrection}
           />
         )}
 
@@ -427,8 +447,10 @@ function MetadataPanel({
   filter,
   progress,
   error,
+  runId,
   onStart,
   onFilter,
+  onSaveCorrection,
 }: {
   itemsCount: number;
   matchRun: MatchRun | null;
@@ -439,8 +461,13 @@ function MetadataPanel({
   filter: MatchFilter;
   progress: number;
   error: string;
+  runId: number | null;
   onStart: () => void;
   onFilter: (filter: MatchFilter) => void;
+  onSaveCorrection: (
+    match: MetadataMatch,
+    correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
+  ) => Promise<void>;
 }) {
   return (
     <>
@@ -485,6 +512,7 @@ function MetadataPanel({
               <div><h2>Match results</h2><p>Scores are heuristic, not probabilities. Review every proposed destination before acting.</p></div>
               <select value={filter} onChange={event => onFilter(event.target.value as MatchFilter)} aria-label="Filter match confidence">
                 <option value="all">All results</option>
+                <option value="review">Review queue</option>
                 <option value="high">High confidence</option>
                 <option value="medium">Medium confidence</option>
                 <option value="low">Low confidence</option>
@@ -494,7 +522,7 @@ function MetadataPanel({
             </div>
             {matches.length === 0
               ? <div className="empty">{matchingActive ? 'Waiting for matching results...' : 'No results for this filter.'}</div>
-              : <div className="match-groups">{groups.map(group => <MetadataGroupCard key={group.key} group={group} />)}</div>}
+              : <div className="match-groups">{groups.map(group => <MetadataGroupCard key={group.key} group={group} runId={runId} onSaveCorrection={onSaveCorrection} />)}</div>}
             <footer>{matches.length} result(s) shown · Metadata matching is read-only</footer>
           </section>
         </>
@@ -503,7 +531,18 @@ function MetadataPanel({
   );
 }
 
-function MetadataGroupCard({ group }: { group: MetadataGroup }) {
+function MetadataGroupCard({
+  group,
+  runId,
+  onSaveCorrection,
+}: {
+  group: MetadataGroup;
+  runId: number | null;
+  onSaveCorrection: (
+    match: MetadataMatch,
+    correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
+  ) => Promise<void>;
+}) {
   const average = Math.round(group.matches.reduce((total, match) => total + match.confidenceScore, 0) / group.matches.length);
   const matchedEpisodes = group.matches.filter(match => match.providerType === 'tv' && match.episodeTitle).length;
   const isSeries = group.mediaType === 'tv';
@@ -518,13 +557,24 @@ function MetadataGroupCard({ group }: { group: MetadataGroup }) {
         <div className="group-score"><ConfidencePill confidence={group.matches.some(match => match.confidence === 'high') ? 'high' : group.matches[0].confidence} /><span>{average}/100 avg.</span></div>
       </summary>
       <div className="match-rows">
-        {group.matches.map(match => <MetadataMatchRow key={match.inventoryId} match={match} />)}
+        {group.matches.map(match => <MetadataMatchRow key={`${runId}:${match.inventoryId}`} match={match} runId={runId} onSaveCorrection={onSaveCorrection} />)}
       </div>
     </details>
   );
 }
 
-function MetadataMatchRow({ match }: { match: MetadataMatch }) {
+function MetadataMatchRow({
+  match,
+  runId,
+  onSaveCorrection,
+}: {
+  match: MetadataMatch;
+  runId: number | null;
+  onSaveCorrection: (
+    match: MetadataMatch,
+    correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
+  ) => Promise<void>;
+}) {
   return (
     <article className="match-row">
       <div className="match-row-main">
@@ -535,6 +585,7 @@ function MetadataMatchRow({ match }: { match: MetadataMatch }) {
       <div className="match-row-score">
         <ConfidencePill confidence={match.confidence} />
         <strong>{match.confidenceScore}/100</strong>
+        {match.manualCorrection && <span className="manual-badge">Verified by you</span>}
       </div>
       <details className="match-explanation">
         <summary>Why?</summary>
@@ -546,7 +597,95 @@ function MetadataMatchRow({ match }: { match: MetadataMatch }) {
           </div>
         )}
       </details>
+      {match.candidates.length > 0 && match.matchStatus !== 'preserved' && runId !== null && (
+        <ReviewEditor key={`${runId}:${match.inventoryId}`} match={match} onSave={onSaveCorrection} />
+      )}
     </article>
+  );
+}
+
+function ReviewEditor({
+  match,
+  onSave,
+}: {
+  match: MetadataMatch;
+  onSave: (
+    match: MetadataMatch,
+    correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
+  ) => Promise<void>;
+}) {
+  const initialCandidate = match.candidates.find(candidate => candidate.id === match.providerId) ?? match.candidates[0];
+  const [candidateId, setCandidateId] = useState(String(initialCandidate?.id ?? ''));
+  const [title, setTitle] = useState(match.title ?? initialCandidate?.title ?? '');
+  const [year, setYear] = useState(String(match.releaseYear ?? initialCandidate?.year ?? ''));
+  const [season, setSeason] = useState(String(match.season ?? ''));
+  const [episode, setEpisode] = useState(String(match.episode ?? ''));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [saved, setSaved] = useState(false);
+  const selected = match.candidates.find(candidate => String(candidate.id) === candidateId);
+  const isTv = selected?.mediaType === 'tv';
+
+  const selectCandidate = (value: string) => {
+    setCandidateId(value);
+    const candidate = match.candidates.find(item => String(item.id) === value);
+    if (!candidate) return;
+    setTitle(candidate.title);
+    setYear(String(candidate.year ?? ''));
+  };
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selected) return;
+    setSaving(true);
+    setError('');
+    setSaved(false);
+    try {
+      await onSave(match, {
+        candidateId: selected.id,
+        title,
+        year: year.trim() ? Number(year) : null,
+        season: isTv && season.trim() ? Number(season) : null,
+        episode: isTv && episode.trim() ? Number(episode) : null,
+      });
+      setSaved(true);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Unable to save this correction.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <details className="review-editor">
+      <summary>{match.manualCorrection ? 'Edit saved correction' : match.matchStatus === 'review' ? 'Review & correct' : 'Edit match'}</summary>
+      <form className="review-form" onSubmit={submit}>
+        <label>
+          Metadata candidate
+          <select value={candidateId} onChange={event => selectCandidate(event.target.value)}>
+            {match.candidates.map(candidate => (
+              <option key={`${candidate.mediaType}-${candidate.id}`} value={candidate.id}>
+                {candidate.title} ({candidate.year ?? 'year unknown'}) · {candidate.score}/100
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="review-fields">
+          <label>Corrected title<input value={title} maxLength={180} required onChange={event => setTitle(event.target.value)} /></label>
+          <label>Release year<input type="number" min={1870} max={new Date().getFullYear() + 10} value={year} onChange={event => setYear(event.target.value)} /></label>
+        </div>
+        {isTv && (
+          <div className="review-fields">
+            <label>Season (0–99)<input type="number" min={0} max={99} value={season} required onChange={event => setSeason(event.target.value)} /></label>
+            <label>Episode (1–999)<input type="number" min={1} max={999} value={episode} required onChange={event => setEpisode(event.target.value)} /></label>
+          </div>
+        )}
+        {error && <p className="review-error">{error}</p>}
+        {saved && <p className="review-success">Correction saved and will be reused on future matching runs.</p>}
+        <button className="small-button" type="submit" disabled={saving || !selected}>{saving ? 'Verifying...' : 'Save correction'}</button>
+        {isTv && <small>Season and episode are checked against TMDB before saving.</small>}
+      </form>
+    </details>
   );
 }
 

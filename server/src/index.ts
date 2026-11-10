@@ -7,6 +7,8 @@ import { promises as fs, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MetadataMatcher } from './services/metadata-matcher.js';
+import { TmdbClient } from './services/tmdb.js';
+import { createMetadataProposal, parseMediaPath, safeMetadataName } from './services/metadata-matching.js';
 
 const ROOT = path.resolve(process.env.MEDIA_ROOT || '/media');
 const DATA = path.resolve(process.env.DATA_DIR || '/app/data');
@@ -24,7 +26,8 @@ CREATE TABLE IF NOT EXISTS metadata_matches (
  run_id INTEGER NOT NULL, inventory_id TEXT NOT NULL, rel TEXT NOT NULL, provider_id INTEGER, provider_type TEXT,
  title TEXT, original_title TEXT, release_year INTEGER, episode_title TEXT, confidence_score INTEGER NOT NULL,
  confidence TEXT NOT NULL, match_status TEXT NOT NULL, explanations TEXT NOT NULL,
- candidates TEXT NOT NULL, season INTEGER, episode INTEGER, proposed_rel TEXT, error TEXT, updated_at TEXT NOT NULL,
+ candidates TEXT NOT NULL, season INTEGER, episode INTEGER, proposed_rel TEXT, error TEXT,
+ manual_correction INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
  PRIMARY KEY (run_id,inventory_id)
 );
 CREATE TABLE IF NOT EXISTS metadata_match_runs (
@@ -32,12 +35,24 @@ CREATE TABLE IF NOT EXISTS metadata_match_runs (
  processed INTEGER NOT NULL DEFAULT 0, matched INTEGER NOT NULL DEFAULT 0, review INTEGER NOT NULL DEFAULT 0,
  unmatched INTEGER NOT NULL DEFAULT 0, preserved INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0, error TEXT,
  started_at TEXT NOT NULL, completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS metadata_corrections (
+ rel TEXT PRIMARY KEY, category TEXT NOT NULL, provider_id INTEGER NOT NULL, provider_type TEXT NOT NULL,
+ provider_title TEXT NOT NULL, original_title TEXT NOT NULL, provider_year INTEGER, corrected_title TEXT NOT NULL,
+ corrected_year INTEGER, aliases TEXT NOT NULL, candidate_set TEXT NOT NULL DEFAULT '[]', season INTEGER, episode INTEGER,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );`);
+const matchColumns=db.prepare('PRAGMA table_info(metadata_matches)').all() as Array<{name:string}>;
+if(!matchColumns.some(column=>column.name==='manual_correction'))db.exec('ALTER TABLE metadata_matches ADD COLUMN manual_correction INTEGER NOT NULL DEFAULT 0');
+if(!matchColumns.some(column=>column.name==='episode_title'))db.exec('ALTER TABLE metadata_matches ADD COLUMN episode_title TEXT');
+const correctionColumns=db.prepare('PRAGMA table_info(metadata_corrections)').all() as Array<{name:string}>;
+if(!correctionColumns.some(column=>column.name==='candidate_set'))db.exec("ALTER TABLE metadata_corrections ADD COLUMN candidate_set TEXT NOT NULL DEFAULT '[]'");
 db.prepare("UPDATE metadata_match_runs SET status='failed',error='Server restarted before matching completed.',completed_at=? WHERE status IN ('queued','running')")
  .run(new Date().toISOString());
 const app = Fastify({logger:true, bodyLimit:64*1024, trustProxy:false});
 await app.register(cookie);
 const metadataMatcher = new MetadataMatcher(db, process.env.TMDB_READ_TOKEN || '');
+const tmdbClient = new TmdbClient(db, process.env.TMDB_READ_TOKEN || '');
 app.addHook('onRequest', async (req, reply) => {
   reply.header('X-Content-Type-Options','nosniff');
   reply.header('X-Frame-Options','DENY');
@@ -101,9 +116,94 @@ app.get('/api/metadata/match/:id',{preHandler:requireAuth},async(req:any,reply)=
  if(!run)return reply.code(404).send({error:'Metadata matching run not found.'});
  const matches=db.prepare(`SELECT inventory_id AS inventoryId,rel,provider_id AS providerId,provider_type AS providerType,
   title,original_title AS originalTitle,release_year AS releaseYear,episode_title AS episodeTitle,confidence_score AS confidenceScore,
-  confidence,match_status AS matchStatus,explanations,candidates,season,episode,proposed_rel AS proposedRel,error,updated_at AS updatedAt
+  confidence,match_status AS matchStatus,explanations,candidates,season,episode,proposed_rel AS proposedRel,error,
+  manual_correction AS manualCorrection,updated_at AS updatedAt
   FROM metadata_matches WHERE run_id=? AND inventory_id IN (SELECT id FROM inventory) ORDER BY rel LIMIT 2000`).all(id);
  return {run,matches:matches.map((row:any)=>({...row,explanations:JSON.parse(row.explanations),candidates:JSON.parse(row.candidates)}))};
+});
+app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
+ const runId=Number(req.params?.runId);
+ const inventoryId=String(req.params?.inventoryId||'');
+ if(!Number.isSafeInteger(runId)||runId<1||!inventoryId)return reply.code(400).send({error:'Invalid review target.'});
+ const runRow=db.prepare('SELECT status FROM metadata_match_runs WHERE id=?').get(runId) as {status:string}|undefined;
+ if(!runRow)return reply.code(404).send({error:'Metadata matching run not found.'});
+ if(runRow.status!=='completed')return reply.code(409).send({error:'Wait for metadata matching to finish before reviewing results.'});
+ const match=db.prepare(`SELECT candidates FROM metadata_matches WHERE run_id=? AND inventory_id=?`)
+  .get(runId,inventoryId) as {candidates:string}|undefined;
+ const item=db.prepare('SELECT id,rel,category FROM inventory WHERE id=?').get(inventoryId) as {id:string,rel:string,category:string}|undefined;
+ if(!match||!item)return reply.code(404).send({error:'Match or inventory item not found.'});
+ const parsed=parseMediaPath(item.rel,item.category);
+ if(parsed.preservedReason)return reply.code(400).send({error:'Preserved files and specials cannot be proposed for renaming.'});
+
+ const body=req.body||{};
+ const candidateId=body.candidateId;
+ const candidates=JSON.parse(match.candidates) as Array<{id:number,mediaType:'movie'|'tv',title:string,originalTitle:string,year?:number,aliases:string[]}>;
+ const candidate=candidates.find(entry=>entry.id===candidateId);
+ if(!candidate)return reply.code(400).send({error:'Select a candidate from this match result.'});
+ if(candidate.mediaType!==parsed.type)return reply.code(400).send({error:'Candidate type does not match the library category.'});
+ if(typeof body.title!=='string'||!body.title.trim()||body.title.length>180)return reply.code(400).send({error:'Enter a title of 1–180 characters.'});
+ const title=safeMetadataName(body.title);
+ const year=body.year===''||body.year===null||body.year===undefined?candidate.year??null:Number(body.year);
+ if(year!==null&&(!Number.isInteger(year)||year<1870||year>new Date().getFullYear()+10))return reply.code(400).send({error:'Enter a valid release year.'});
+ let season:number|null=null,episode:number|null=null,episodeTitle:string|null=null;
+ const categoryType=item.category.startsWith('movies/')?'movie':'tv';
+ if(categoryType==='movie'){
+  if(year===null)return reply.code(400).send({error:'A release year is required to propose a movie destination.'});
+ }else{
+  season=body.season===''||body.season===null||body.season===undefined?null:Number(body.season);
+  episode=body.episode===''||body.episode===null||body.episode===undefined?null:Number(body.episode);
+  if(season===null||episode===null||!Number.isInteger(season)||season<0||season>99||!Number.isInteger(episode)||episode<1||episode>999){
+   return reply.code(400).send({error:'Enter a valid season (0–99) and episode (1–999) mapping.'});
+  }
+  try{
+   const episodes=await tmdbClient.season(candidate.id,season);
+   const providerEpisode=episodes.find(entry=>entry.episode_number===episode);
+   if(!providerEpisode)return reply.code(400).send({error:`TMDB has no episode ${season}x${episode} for the selected series.`});
+   episodeTitle=providerEpisode.name;
+  }catch(error){
+   req.log.error({err:error,runId,inventoryId},'Failed to validate manually selected episode');
+   return reply.code(502).send({error:error instanceof Error?`Could not verify episode mapping: ${error.message}`:'Could not verify episode mapping.'});
+  }
+ }
+ const proposal=createMetadataProposal({category:item.category,type:categoryType,title,year,season,episode,extension:path.posix.extname(item.rel)});
+ if(!proposal)return reply.code(400).send({error:'Unable to create a safe destination from the supplied correction.'});
+ const now=new Date().toISOString();
+ const explanations=[
+  'Provider candidate and title were manually selected by the user.',
+  categoryType==='tv'?'Season and episode were manually selected and verified against TMDB.':'Release year was manually confirmed.',
+ ];
+ const update=db.transaction(()=>{
+  db.prepare(`INSERT INTO metadata_corrections
+   (rel,category,provider_id,provider_type,provider_title,original_title,provider_year,corrected_title,corrected_year,aliases,candidate_set,season,episode,created_at,updated_at)
+   VALUES (@rel,@category,@providerId,@providerType,@providerTitle,@originalTitle,@providerYear,@title,@year,@aliases,@candidateSet,@season,@episode,@now,@now)
+   ON CONFLICT(rel) DO UPDATE SET category=excluded.category,provider_id=excluded.provider_id,provider_type=excluded.provider_type,
+    provider_title=excluded.provider_title,original_title=excluded.original_title,provider_year=excluded.provider_year,
+    corrected_title=excluded.corrected_title,corrected_year=excluded.corrected_year,aliases=excluded.aliases,candidate_set=excluded.candidate_set,
+    season=excluded.season,episode=excluded.episode,updated_at=excluded.updated_at`)
+   .run({rel:item.rel,category:item.category,providerId:candidate.id,providerType:candidate.mediaType,providerTitle:candidate.title,
+    originalTitle:candidate.originalTitle,providerYear:candidate.year??null,title,year,aliases:JSON.stringify(candidate.aliases),
+    candidateSet:JSON.stringify(candidates),season,episode,now});
+  db.prepare(`UPDATE metadata_matches SET provider_id=?,provider_type=?,title=?,original_title=?,release_year=?,episode_title=?,
+   confidence_score=100,confidence='high',match_status='matched',explanations=?,season=?,episode=?,proposed_rel=?,error=NULL,
+   manual_correction=1,updated_at=? WHERE run_id=? AND inventory_id=?`)
+   .run(candidate.id,candidate.mediaType,title,candidate.originalTitle,year,episodeTitle,JSON.stringify(explanations),season,episode,proposal,now,runId,inventoryId);
+  const counts=db.prepare(`SELECT
+   SUM(CASE WHEN match_status='matched' THEN 1 ELSE 0 END) AS matched,
+   SUM(CASE WHEN match_status='review' THEN 1 ELSE 0 END) AS review,
+   SUM(CASE WHEN match_status='unmatched' THEN 1 ELSE 0 END) AS unmatched,
+   SUM(CASE WHEN match_status='preserved' THEN 1 ELSE 0 END) AS preserved
+   FROM metadata_matches WHERE run_id=?`).get(runId) as {matched:number,review:number,unmatched:number,preserved:number};
+  db.prepare('UPDATE metadata_match_runs SET matched=?,review=?,unmatched=?,preserved=? WHERE id=?')
+   .run(counts.matched||0,counts.review||0,counts.unmatched||0,counts.preserved||0,runId);
+ });
+ update();
+ const updated=db.prepare(`SELECT inventory_id AS inventoryId,rel,provider_id AS providerId,provider_type AS providerType,
+  title,original_title AS originalTitle,release_year AS releaseYear,episode_title AS episodeTitle,confidence_score AS confidenceScore,
+  confidence,match_status AS matchStatus,explanations,candidates,season,episode,proposed_rel AS proposedRel,error,
+  manual_correction AS manualCorrection,updated_at AS updatedAt
+  FROM metadata_matches WHERE run_id=? AND inventory_id=?`).get(runId,inventoryId) as any;
+ const updatedRun=db.prepare('SELECT * FROM metadata_match_runs WHERE id=?').get(runId);
+ return {run:updatedRun,match:{...updated,explanations:JSON.parse(updated.explanations),candidates:JSON.parse(updated.candidates)}};
 });
 
 const videoExt=new Set(['.mkv','.mp4','.avi','.m4v','.mov','.webm']);

@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import {
   parseMediaPath,
+  createMetadataProposal,
   safeMetadataName,
   scoreCandidates,
   type Confidence,
@@ -17,6 +18,22 @@ interface InventoryRow {
 
 interface MatchRun {
   id: number;
+}
+
+interface MetadataCorrection {
+  rel: string;
+  category: string;
+  provider_id: number;
+  provider_type: 'movie' | 'tv';
+  provider_title: string;
+  original_title: string;
+  provider_year: number | null;
+  corrected_title: string;
+  corrected_year: number | null;
+  aliases: string;
+  candidate_set: string;
+  season: number | null;
+  episode: number | null;
 }
 
 export class MetadataMatcher {
@@ -80,6 +97,9 @@ export class MetadataMatcher {
     if (parsed.preservedReason) {
       return this.makeRecord(row, parsed, { score: 0, confidence: 'preserved', candidates: [], explanations: [parsed.preservedReason] });
     }
+    const correction = this.db.prepare('SELECT * FROM metadata_corrections WHERE rel=? AND category=?')
+      .get(row.rel, row.category) as MetadataCorrection | undefined;
+    if (correction) return this.applyCorrection(row, parsed, correction);
     if (!parsed.title) {
       return this.makeRecord(row, parsed, { score: 0, confidence: 'unmatched', candidates: [], explanations: ['No reliable title could be extracted.'] });
     }
@@ -140,12 +160,23 @@ export class MetadataMatcher {
     return record;
   }
 
-  private async episodeMapping(parsed: ParsedMedia, candidate: MetadataCandidate): Promise<{ proposal?: string; episodeTitle?: string; blockReason?: string }> {
+  private async episodeMapping(
+    parsed: ParsedMedia,
+    candidate: MetadataCandidate,
+    corrected?: { title: string; year: number | null },
+  ): Promise<{ proposal?: string; episodeTitle?: string; blockReason?: string }> {
+    const outputTitle = safeMetadataName(corrected?.title ?? candidate.title);
+    const outputYear = corrected ? corrected.year : candidate.year ?? null;
     if (parsed.type === 'movie') {
-      if (candidate.year === undefined) return { blockReason: 'Provider metadata has no release year; a safe destination cannot be generated.' };
-      const title = safeMetadataName(candidate.title);
-      const folder = safeMetadataName(`${title} (${candidate.year})`);
-      return { proposal: `${this.categoryPath(parsed)}/${folder}/${folder}${parsed.extension}` };
+      if (outputYear === null) return { blockReason: 'Provider metadata has no release year; a safe destination cannot be generated.' };
+      const proposal = createMetadataProposal({
+        category: this.categoryPath(parsed),
+        type: parsed.type,
+        title: outputTitle,
+        year: outputYear,
+        extension: parsed.extension,
+      });
+      return proposal ? { proposal } : { blockReason: 'Metadata could not be converted to a safe movie destination.' };
     }
 
     if (parsed.episodeStyle === 'absolute') {
@@ -168,11 +199,107 @@ export class MetadataMatcher {
     const episode = episodes.find(item => item.episode_number === parsed.episode);
     if (!episode) return { blockReason: `TMDB has no episode ${parsed.season}x${parsed.episode} for this series.` };
 
-    const title = safeMetadataName(candidate.title);
-    const folder = safeMetadataName(candidate.year === undefined ? title : `${title} (${candidate.year})`);
-    const seasonFolder = `Season ${String(parsed.season).padStart(2, '0')}`;
-    const filename = `${title} - S${String(parsed.season).padStart(2, '0')}E${String(parsed.episode).padStart(2, '0')}${parsed.extension}`;
-    return { proposal: `${this.categoryPath(parsed)}/${folder}/${seasonFolder}/${filename}`, episodeTitle: episode.name };
+    const proposal = createMetadataProposal({
+      category: this.categoryPath(parsed),
+      type: parsed.type,
+      title: outputTitle,
+      year: outputYear,
+      season: parsed.season,
+      episode: parsed.episode,
+      extension: parsed.extension,
+    });
+    return proposal
+      ? { proposal, episodeTitle: episode.name }
+      : { blockReason: 'Metadata could not be converted to a safe episode destination.' };
+  }
+
+  private async applyCorrection(row: InventoryRow, parsed: ParsedMedia, correction: MetadataCorrection) {
+    let aliases: string[];
+    try {
+      const value: unknown = JSON.parse(correction.aliases);
+      if (!Array.isArray(value) || !value.every(alias => typeof alias === 'string')) throw new Error('Invalid stored aliases.');
+      aliases = value;
+    } catch (error) {
+      throw new Error(`Saved metadata correction for "${row.rel}" is invalid: ${error instanceof Error ? error.message : 'unknown error'}`);
+    }
+
+    const candidate: MetadataCandidate = {
+      id: correction.provider_id,
+      mediaType: correction.provider_type,
+      title: correction.provider_title,
+      originalTitle: correction.original_title,
+      year: correction.provider_year ?? undefined,
+      aliases,
+      score: 100,
+      titleSimilarity: 1,
+      explanations: ['This provider match was manually selected and saved for reuse.'],
+      ambiguous: false,
+    };
+    let candidates: MetadataCandidate[] = [candidate];
+    try {
+      const savedCandidates: unknown = JSON.parse(correction.candidate_set);
+      if (!Array.isArray(savedCandidates)) throw new Error('Invalid candidate list.');
+      const previousCandidates = savedCandidates.flatMap((entry: unknown) => {
+        if (typeof entry !== 'object' || entry === null) return [];
+        const value = entry as Partial<MetadataCandidate>;
+        if (!Number.isSafeInteger(value.id)
+          || (value.mediaType !== 'movie' && value.mediaType !== 'tv')
+          || typeof value.title !== 'string'
+          || typeof value.originalTitle !== 'string'
+          || !Array.isArray(value.aliases)
+          || !value.aliases.every(alias => typeof alias === 'string')) return [];
+        return [{
+          id: value.id as number,
+          mediaType: value.mediaType,
+          title: value.title,
+          originalTitle: value.originalTitle,
+          year: Number.isInteger(value.year) ? value.year : undefined,
+          aliases: value.aliases,
+          score: value.id === candidate.id ? 100 : typeof value.score === 'number' && Number.isInteger(value.score) ? value.score : 0,
+          titleSimilarity: typeof value.titleSimilarity === 'number' && Number.isFinite(value.titleSimilarity) ? value.titleSimilarity : 0,
+          explanations: Array.isArray(value.explanations) && value.explanations.every(note => typeof note === 'string') ? value.explanations : [],
+          ambiguous: value.id !== candidate.id && Boolean(value.ambiguous),
+        }];
+      });
+      if (previousCandidates.some(entry => entry.id === candidate.id && entry.mediaType === candidate.mediaType)) {
+        candidates = previousCandidates;
+      }
+    } catch (error) {
+      throw new Error(`Saved candidate list for "${row.rel}" is invalid: ${error instanceof Error ? error.message : 'unknown error'}`);
+    }
+    const correctedParsed: ParsedMedia = {
+      ...parsed,
+      title: correction.corrected_title,
+      year: correction.corrected_year ?? undefined,
+      season: correction.season ?? undefined,
+      episode: correction.episode ?? undefined,
+      episodeStyle: correction.provider_type === 'tv' ? 'season-episode' : undefined,
+      folderSeason: correction.season ?? undefined,
+    };
+    const mapping = await this.episodeMapping(correctedParsed, candidate, {
+      title: correction.corrected_title,
+      year: correction.corrected_year,
+    });
+    const record = this.makeRecord(row, correctedParsed, {
+      candidate,
+      candidates,
+      score: 100,
+      confidence: 'high',
+      explanations: ['This provider match and correction were manually selected and saved for reuse.'],
+    }, mapping.proposal, undefined, mapping.episodeTitle);
+    record.title = correction.corrected_title;
+    record.releaseYear = correction.corrected_year;
+    record.manualCorrection = true;
+    if (mapping.blockReason) {
+      record.confidence = 'medium';
+      record.confidenceScore = 89;
+      record.matchStatus = 'review';
+      record.proposedRel = null;
+      record.explanations.push(mapping.blockReason);
+    } else {
+      record.matchStatus = 'matched';
+    }
+    return record;
   }
 
   private categoryPath(parsed: ParsedMedia): string {
@@ -210,6 +337,7 @@ export class MetadataMatcher {
       episode: parsed.episode ?? null,
       proposedRel: proposedRel ?? null,
       error: error ?? null,
+      manualCorrection: false,
       updatedAt: new Date().toISOString(),
     };
   }
@@ -217,9 +345,9 @@ export class MetadataMatcher {
   private saveRecord(runId: number, record: ReturnType<typeof this.makeRecord>): void {
     this.db.prepare(`INSERT OR REPLACE INTO metadata_matches
       (run_id,inventory_id,rel,provider_id,provider_type,title,original_title,release_year,confidence_score,confidence,
-       episode_title,match_status,explanations,candidates,season,episode,proposed_rel,error,updated_at)
+       episode_title,match_status,explanations,candidates,season,episode,proposed_rel,error,manual_correction,updated_at)
       VALUES (@runId,@inventoryId,@rel,@providerId,@providerType,@title,@originalTitle,@releaseYear,@confidenceScore,@confidence,
-       @episodeTitle,@matchStatus,@explanations,@candidates,@season,@episode,@proposedRel,@error,@updatedAt)`)
+       @episodeTitle,@matchStatus,@explanations,@candidates,@season,@episode,@proposedRel,@error,@manualCorrection,@updatedAt)`)
       .run({
         runId,
         ...record,

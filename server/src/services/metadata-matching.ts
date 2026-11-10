@@ -38,6 +38,32 @@ export interface ScoredMatch {
   explanations: string[];
 }
 
+export function createMetadataProposal(input: {
+  category: string;
+  type: MediaType;
+  title: string;
+  year: number | null;
+  season?: number | null;
+  episode?: number | null;
+  extension: string;
+}): string | null {
+  const categories = ['movies/Anime', 'movies/Movies', 'shows/Anime', 'shows/Tv Shows'];
+  if (!categories.includes(input.category) || !/^\.[a-z0-9]{1,8}$/i.test(input.extension)) return null;
+  const title = safeMetadataName(input.title);
+  if (input.type === 'movie') {
+    if (input.year === null || !Number.isInteger(input.year)) return null;
+    const folder = safeMetadataName(`${title} (${input.year})`);
+    return `${input.category}/${folder}/${folder}${input.extension}`;
+  }
+  if (input.season == null || input.episode == null
+    || !Number.isInteger(input.season) || input.season < 0 || input.season > 99
+    || !Number.isInteger(input.episode) || input.episode < 1 || input.episode > 999) return null;
+  const folder = safeMetadataName(input.year === null ? title : `${title} (${input.year})`);
+  const seasonFolder = `Season ${String(input.season).padStart(2, '0')}`;
+  const filename = `${title} - S${String(input.season).padStart(2, '0')}E${String(input.episode).padStart(2, '0')}${input.extension}`;
+  return `${input.category}/${folder}/${seasonFolder}/${filename}`;
+}
+
 const releaseSuffix = /\b(?:web[- .]?dl|web[- .]?rip|bluray|bdrip|hdtv|dvdrip|proper|repack|x26[45]|h\.?26[45]|hevc|avc|aac|dts|flac|10bit|8bit|1080p|2160p|720p|480p|multi[- ]audio|dual[- ]audio|eng(?:lish)?[- ]dub|subbed|eztv(?:x)?(?:\.to)?)\b.*$/i;
 
 function stripExtension(filename: string): { stem: string; extension: string } {

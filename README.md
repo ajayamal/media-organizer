@@ -107,6 +107,8 @@ Scores are deterministic (title similarity, year evidence, and media type): 90â€
 
 Episode proposals require a standard `SxxEyy` filename and a matching TMDB season/episode. Absolute anime episode numbers, specials, conflicting season folders, ambiguous candidates, and year mismatches remain in review. This phase only writes matching metadata to the app database; it never renames files.
 
+The metadata tab includes a review queue. Choose among stored provider candidates, edit the display title/year, and for TV verify or correct the season/episode mapping. The server verifies episode mappings with TMDB, computes the destination from the inventory record (never from a client-supplied path), and stores the correction by media path for future scans and matching runs. Corrections update metadata only and do not execute renames.
+
 ```bash
 cd server && npm install && ADMIN_PASSWORD='replace-with-a-long-random-password' MEDIA_ROOT=/srv/data DATA_DIR=./dev-data npm run dev
 # separate terminal:

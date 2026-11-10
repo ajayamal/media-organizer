@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeTitle, parseMediaPath, scoreCandidates } from '../src/services/metadata-matching.js';
+import { createMetadataProposal, normalizeTitle, parseMediaPath, scoreCandidates } from '../src/services/metadata-matching.js';
 
 test('normalizes punctuation without discarding Japanese script', () => {
   assert.equal(normalizeTitle('Spirited.Away (2001)!'), 'spirited away 2001');
@@ -88,4 +88,53 @@ test('preserves AppleDouble files, specials, and extras', () => {
     const category = rel.startsWith('movies/') ? 'movies/Anime' : 'shows/Anime';
     assert.ok(parseMediaPath(rel, category).preservedReason, rel);
   }
+});
+
+test('builds safe proposals from metadata rather than path input', () => {
+  assert.equal(
+    createMetadataProposal({
+      category: 'movies/Movies',
+      type: 'movie',
+      title: '../Example: Film',
+      year: 2020,
+      extension: '.mkv',
+    }),
+    'movies/Movies/.. Example Film (2020)/.. Example Film (2020).mkv',
+  );
+  assert.equal(
+    createMetadataProposal({
+      category: 'shows/Tv Shows',
+      type: 'tv',
+      title: 'Example',
+      year: 2020,
+      season: 2,
+      episode: 3,
+      extension: '.mkv',
+    }),
+    'shows/Tv Shows/Example (2020)/Season 02/Example - S02E03.mkv',
+  );
+});
+
+test('rejects unsafe categories, missing episode mappings, and invalid extensions', () => {
+  assert.equal(createMetadataProposal({
+    category: '../movies/Movies',
+    type: 'movie',
+    title: 'Example',
+    year: 2020,
+    extension: '.mkv',
+  }), null);
+  assert.equal(createMetadataProposal({
+    category: 'shows/Anime',
+    type: 'tv',
+    title: 'Example',
+    year: null,
+    extension: '.mkv',
+  }), null);
+  assert.equal(createMetadataProposal({
+    category: 'movies/Anime',
+    type: 'movie',
+    title: 'Example',
+    year: 2020,
+    extension: '/../../etc/passwd',
+  }), null);
 });
