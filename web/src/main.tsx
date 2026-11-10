@@ -124,6 +124,17 @@ type AuditReport = {
   hashErrors: Array<{ rel: string; error: string }>;
 };
 
+type QuarantineEntry = {
+  id: number;
+  auditRunId: number;
+  originalRel: string;
+  quarantineRel: string;
+  bytes: number;
+  status: 'moving' | 'quarantined' | 'restoring' | 'restored' | 'failed';
+  error: string | null;
+  createdAt: string;
+};
+
 type MetadataGroup = {
   key: string;
   title: string;
@@ -176,14 +187,17 @@ function App() {
   const [auditBusy, setAuditBusy] = useState(false);
   const [auditError, setAuditError] = useState('');
   const [auditQuery, setAuditQuery] = useState('');
+  const [quarantineEntries, setQuarantineEntries] = useState<QuarantineEntry[]>([]);
 
   const load = async () => {
-    const [inventory, history] = await Promise.all([
+    const [inventory, history, quarantine] = await Promise.all([
       api<{ items: Item[] }>('/inventory'),
       api<{ items: Op[] }>('/operations'),
+      api<{ items: QuarantineEntry[] }>('/quarantine'),
     ]);
     setItems(inventory.items);
     setOps(history.items);
+    setQuarantineEntries(quarantine.items);
   };
 
   useEffect(() => {
@@ -330,6 +344,71 @@ function App() {
     }
   };
 
+  const refreshAudit = async (runId: number) => {
+    const quarantine = await api<{ items: QuarantineEntry[] }>('/quarantine');
+    setQuarantineEntries(quarantine.items);
+    try {
+      const report = await api<AuditReport>(`/audit/${runId}`);
+      setAuditReport(report);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'File audit run not found.') {
+        setAuditReport(null);
+        setAuditRunId(null);
+        window.sessionStorage.removeItem('media-organizer-audit-run');
+        setAuditError('This audit has expired; start a new audit to review remaining duplicates.');
+        return;
+      }
+      throw error;
+    }
+  };
+
+  const quarantineDuplicates = async (runId: number, keepRel: string, removeRels: string[]) => {
+    if (!writes) {
+      setAuditError('Enable write mode in the deployment configuration before quarantining files.');
+      return;
+    }
+    const preview = removeRels.slice(0, 100);
+    if (!window.confirm(`Keep:\n${keepRel}\n\nMove ${preview.length} identical non-video file(s) to the reversible quarantine folder?`)) return;
+    setAuditBusy(true);
+    setAuditError('');
+    try {
+      const result = await api<{ moved: string[]; failures: Array<{ rel: string; error: string }> }>(
+        `/audit/${runId}/quarantine`,
+        'POST',
+        { keepRel, removeRels: preview },
+      );
+      await refreshAudit(runId);
+      if (result.failures.length > 0) {
+        setAuditError(`${result.moved.length} file(s) quarantined; ${result.failures.length} could not be moved: ${result.failures.map(file => `${file.rel}: ${file.error}`).join('; ')}`);
+      } else {
+        setMsg(`${result.moved.length} duplicate file(s) moved to quarantine. They can be restored below.`);
+      }
+    } catch (error) {
+      setAuditError(error instanceof Error ? error.message : 'Unable to quarantine duplicate files.');
+    } finally {
+      setAuditBusy(false);
+    }
+  };
+
+  const restoreQuarantined = async (entry: QuarantineEntry) => {
+    if (!writes) {
+      setAuditError('Enable write mode in the deployment configuration before restoring files.');
+      return;
+    }
+    if (!window.confirm(`Restore this file to its original path?\n\n${entry.originalRel}`)) return;
+    setAuditBusy(true);
+    setAuditError('');
+    try {
+      await api(`/quarantine/${entry.id}/restore`, 'POST', {});
+      await refreshAudit(entry.auditRunId);
+      setMsg(`Restored ${entry.originalRel}.`);
+    } catch (error) {
+      setAuditError(error instanceof Error ? error.message : 'Unable to restore quarantined file.');
+    } finally {
+      setAuditBusy(false);
+    }
+  };
+
   const saveCorrection = async (
     match: MetadataMatch,
     correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
@@ -364,6 +443,7 @@ function App() {
     setMatches([]);
     setAuditRunId(null);
     setAuditReport(null);
+    setQuarantineEntries([]);
     window.sessionStorage.removeItem('media-organizer-metadata-run');
     window.sessionStorage.removeItem('media-organizer-audit-run');
   });
@@ -433,7 +513,7 @@ function App() {
             <p>{tab === 'library'
               ? 'Scan, review, and organize your existing files safely.'
               : tab === 'audit'
-                ? 'Find exact duplicate files and review media-related files without changing anything.'
+                ? 'Find exact duplicates and non-video files; optionally quarantine selected duplicate copies.'
                 : tab === 'metadata'
                   ? 'Find provider matches and review safe rename proposals.'
                   : 'Review applied changes and undo eligible renames.'}</p>
@@ -504,7 +584,12 @@ function App() {
             report={auditReport}
             error={auditError}
             query={auditQuery}
+            writes={writes}
+            busy={auditBusy}
+            quarantineEntries={quarantineEntries}
             onQuery={setAuditQuery}
+            onQuarantine={quarantineDuplicates}
+            onRestore={restoreQuarantined}
           />
         )}
 
@@ -528,7 +613,7 @@ function App() {
         )}
 
         <div className="footnote"><ShieldCheck size={15} />{tab === 'audit'
-          ? 'File audits are read-only. Exact duplicate groups are SHA-256 verified; files are never moved or deleted.'
+          ? 'The scan is read-only. Selected non-video duplicates can be moved to quarantine and restored later.'
           : 'Only video files are scanned for rename suggestions. Extras and AppleDouble files are preserved; subtitles are never deleted.'}</div>
       </main>
     </div>
@@ -561,12 +646,22 @@ function FileAuditPanel({
   report,
   error,
   query,
+  writes,
+  busy,
+  quarantineEntries,
   onQuery,
+  onQuarantine,
+  onRestore,
 }: {
   report: AuditReport | null;
   error: string;
   query: string;
+  writes: boolean;
+  busy: boolean;
+  quarantineEntries: QuarantineEntry[];
   onQuery: (value: string) => void;
+  onQuarantine: (runId: number, keepRel: string, removeRels: string[]) => Promise<void>;
+  onRestore: (entry: QuarantineEntry) => Promise<void>;
 }) {
   if (!report) {
     return (
@@ -574,12 +669,13 @@ function FileAuditPanel({
         <section className="metadata-intro panel">
           <div className="metadata-intro-icon"><Copy size={21} /></div>
           <div className="metadata-intro-copy">
-            <h2>Read-only duplicate and file inventory</h2>
-            <p>SHA-256 hashes are computed only for files sharing a size, then compared exactly. Common subtitles, artwork, metadata, and archives are listed; other file types are summarized by extension.</p>
+            <h2>Duplicates and non-video files</h2>
+            <p>SHA-256 hashes are computed only for files sharing a size. Review common media files and optionally move selected non-video duplicates to reversible quarantine.</p>
           </div>
         </section>
         {error && <div className="notice"><AlertTriangle size={16} />{error}</div>}
         <div className="empty panel-empty">Start an audit to scan files in the configured media folders.</div>
+        <QuarantineSection entries={quarantineEntries} writes={writes} busy={busy} onRestore={onRestore} />
       </>
     );
   }
@@ -633,11 +729,14 @@ function FileAuditPanel({
               ? <div className="empty audit-empty">{run.duplicate_groups === 0 ? 'No exact duplicates found.' : 'No duplicate paths match your search.'}</div>
               : <div className="audit-list">
               {visibleDuplicateGroups.map(group => (
-                <details className="audit-group" key={group.hash}>
-                  <summary><strong>{group.count} identical files</strong><span>{formatBytes(group.bytes)} each</span></summary>
-                  <ul>{group.files.map(file => <li key={file.rel}><code>{file.rel}</code><span>{file.kind}</span></li>)}</ul>
-                  {group.files.length < group.count && <p className="audit-limit">Showing {group.files.length.toLocaleString()} of {group.count.toLocaleString()} identical paths.</p>}
-                </details>
+                <DuplicateCleanupGroup
+                  key={group.hash}
+                  runId={run.id}
+                  group={group}
+                  writes={writes}
+                  busy={busy}
+                  onQuarantine={onQuarantine}
+                />
               ))}
               {run.duplicate_groups > report.duplicateGroups.length && <p className="audit-limit">Showing the first {report.duplicateGroups.length} duplicate groups.</p>}
             </div>}
@@ -675,6 +774,7 @@ function FileAuditPanel({
               </table>
             </div>}
         </section>
+        <QuarantineSection entries={quarantineEntries} writes={writes} busy={busy} onRestore={onRestore} />
         {run.errors > 0 && (
           <section className="audit-section">
             <h3>Files not verified <span>{run.errors.toLocaleString()}</span></h3>
@@ -682,9 +782,98 @@ function FileAuditPanel({
             {run.errors > report.hashErrors.length && <p className="audit-limit">Showing {report.hashErrors.length.toLocaleString()} of {run.errors.toLocaleString()} hash errors.</p>}
           </section>
         )}
-        <footer>Read-only audit · No files are modified</footer>
+        <footer>The scan itself is read-only · Only explicitly selected non-video copies can be quarantined</footer>
       </section>
     </>
+  );
+}
+
+function DuplicateCleanupGroup({
+  runId,
+  group,
+  writes,
+  busy,
+  onQuarantine,
+}: {
+  runId: number;
+  group: AuditReport['duplicateGroups'][number];
+  writes: boolean;
+  busy: boolean;
+  onQuarantine: (runId: number, keepRel: string, removeRels: string[]) => Promise<void>;
+}) {
+  const [keepRel, setKeepRel] = useState('');
+  useEffect(() => {
+    if (keepRel && !group.files.some(file => file.rel === keepRel)) setKeepRel('');
+  }, [group.files, keepRel]);
+  const removable = group.files.filter(file => file.kind !== 'video' && file.rel !== keepRel);
+  const batch = removable.slice(0, 100);
+  const videoOnly = group.files.every(file => file.kind === 'video');
+  const truncated = group.files.length < group.count;
+
+  return (
+    <details className="audit-group">
+      <summary><strong>{group.count} identical files</strong><span>{formatBytes(group.bytes)} each</span></summary>
+      <div className="duplicate-group-files">
+        <p>Choose the copy to keep. Only non-video copies can be moved to quarantine.</p>
+        {group.files.map(file => (
+          <label key={file.rel} className="duplicate-copy">
+            <input type="radio" name={`keep-${runId}-${group.hash}`} value={file.rel} checked={keepRel === file.rel} onChange={() => setKeepRel(file.rel)} />
+            <code>{file.rel}</code>
+            <span>{file.kind}</span>
+            {file.kind === 'video' && <span className="keep-only">Keep only</span>}
+          </label>
+        ))}
+        {truncated && <p className="audit-limit">Showing {group.files.length.toLocaleString()} of {group.count.toLocaleString()} identical paths. This group exceeds the display limit and cannot be changed here.</p>}
+        {videoOnly
+          ? <p className="audit-limit">This group contains only video files; duplicate cleanup is limited to non-video files.</p>
+          : truncated
+            ? null
+          : <div className="duplicate-cleanup-action">
+            {!writes && <p className="write-warning">Enable write mode in the deployment configuration to move files to quarantine.</p>}
+            {batch.length > 0 && <button className="small-button" disabled={!writes || busy || !keepRel} onClick={() => void onQuarantine(runId, keepRel, batch.map(file => file.rel))}>
+              {batch.length < removable.length ? `Quarantine next ${batch.length} non-video copies` : `Quarantine ${batch.length} non-video ${batch.length === 1 ? 'copy' : 'copies'}`}
+            </button>}
+            {batch.length === 0 && keepRel && <p className="audit-limit">No other non-video copies can be moved from this group.</p>}
+          </div>}
+      </div>
+    </details>
+  );
+}
+
+function QuarantineSection({
+  entries,
+  writes,
+  busy,
+  onRestore,
+}: {
+  entries: QuarantineEntry[];
+  writes: boolean;
+  busy: boolean;
+  onRestore: (entry: QuarantineEntry) => Promise<void>;
+}) {
+  if (entries.length === 0) return null;
+  return (
+    <section className="panel audit-results">
+      <div className="audit-section">
+        <h3>Quarantined duplicates <span>{entries.filter(entry => entry.status === 'quarantined').length.toLocaleString()}</span></h3>
+        <p className="quarantine-help">Quarantined files are kept under the media root in `.media-organizer-quarantine` and can be restored while write mode is enabled.</p>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Original path</th><th>Size</th><th>Status</th><th>Action</th></tr></thead>
+            <tbody>{entries.map(entry => (
+              <tr key={entry.id}>
+                <td className="file-path">{entry.originalRel}</td>
+                <td>{formatBytes(entry.bytes)}</td>
+                <td>{entry.status === 'quarantined' ? 'Quarantined' : entry.error || entry.status}</td>
+                <td>{entry.status === 'quarantined' || entry.status === 'moving'
+                  ? <button className="small-button" disabled={!writes || busy || entry.status !== 'quarantined'} onClick={() => void onRestore(entry)}>Restore</button>
+                  : <span className="dash">—</span>}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   );
 }
 

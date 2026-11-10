@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { lstat, readdir } from 'node:fs/promises';
+import { lstat, mkdir, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
@@ -52,6 +52,101 @@ export class FileAudit {
     private readonly root: string,
     private readonly categories: string[],
   ) {}
+
+  async verifyFile(rel: string, expectedHash: string): Promise<{ absolutePath: string; bytes: number; device: number; inode: number }> {
+    if (!this.isManagedPath(rel)) throw new Error('File path is outside the audited media folders.');
+    const absolutePath = path.resolve(this.root, rel);
+    const relative = path.relative(this.root, absolutePath);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('File path escaped the media root.');
+    }
+
+    let current = this.root;
+    for (const part of rel.split('/')) {
+      current = path.join(current, part);
+      const stat = await lstat(current);
+      if (stat.isSymbolicLink()) throw new Error('Symlink path blocked.');
+      if (current !== absolutePath && !stat.isDirectory()) throw new Error('File path contains a non-directory parent.');
+    }
+
+    const stat = await lstat(absolutePath);
+    if (!stat.isFile()) throw new Error('Only regular files can be quarantined.');
+    const { extension, kind } = classifyFile(path.posix.basename(rel));
+    if (kind === 'video') throw new Error('Video files cannot be removed by duplicate cleanup.');
+    const actualHash = await hashFile(absolutePath, {
+      rel,
+      category: this.categoryFor(rel),
+      extension,
+      kind,
+      bytes: stat.size,
+      modifiedAt: stat.mtimeMs,
+    });
+    if (actualHash !== expectedHash) throw new Error('File contents changed since the audit; run the audit again.');
+    return { absolutePath, bytes: stat.size, device: stat.dev, inode: stat.ino };
+  }
+
+  async verifyQuarantineFile(rel: string, expectedHash: string): Promise<{ absolutePath: string; bytes: number; device: number; inode: number }> {
+    const parts = rel.split('/');
+    if (parts.length !== 3 || parts[0] !== '.media-organizer-quarantine'
+      || !/^audit-\d+$/.test(parts[1]) || !/^[a-f0-9]{64}$/.test(parts[2])) {
+      throw new Error('Invalid quarantine file path.');
+    }
+    const absolutePath = path.resolve(this.root, rel);
+    let current = this.root;
+    for (const part of parts) {
+      current = path.join(current, part);
+      const stat = await lstat(current);
+      if (stat.isSymbolicLink()) throw new Error('Symlink quarantine path blocked.');
+      if (current !== absolutePath && !stat.isDirectory()) throw new Error('Quarantine path contains a non-directory parent.');
+    }
+    const stat = await lstat(absolutePath);
+    if (!stat.isFile()) throw new Error('Quarantine entry is not a regular file.');
+    const actualHash = await hashFile(absolutePath, {
+      rel,
+      category: 'quarantine',
+      extension: path.extname(absolutePath),
+      kind: 'quarantine',
+      bytes: stat.size,
+      modifiedAt: stat.mtimeMs,
+    });
+    if (actualHash !== expectedHash) throw new Error('Quarantined file contents changed; restore was blocked.');
+    return { absolutePath, bytes: stat.size, device: stat.dev, inode: stat.ino };
+  }
+
+  quarantinePath(runId: number, rel: string): string {
+    if (!this.isManagedPath(rel)) throw new Error('File path is outside the audited media folders.');
+    const pathHash = createHash('sha256').update(rel).digest('hex');
+    return path.join(this.root, '.media-organizer-quarantine', `audit-${runId}`, pathHash);
+  }
+
+  async ensureQuarantineDirectory(runId: number): Promise<string> {
+    const directory = path.join(this.root, '.media-organizer-quarantine', `audit-${runId}`);
+    const rootDirectory = path.dirname(directory);
+    await mkdir(rootDirectory, { recursive: true });
+    const rootStat = await lstat(rootDirectory);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error('Quarantine directory is not a safe directory.');
+    await mkdir(directory, { recursive: true });
+    const directoryStat = await lstat(directory);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) throw new Error('Quarantine directory is not a safe directory.');
+    return directory;
+  }
+
+  async ensureRestoreDirectory(rel: string): Promise<string> {
+    if (!this.isManagedPath(rel)) throw new Error('Restore path is outside the audited media folders.');
+    let current = this.root;
+    const parts = rel.split('/');
+    for (const part of parts.slice(0, -1)) {
+      current = path.join(current, part);
+      try {
+        await mkdir(current);
+      } catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error;
+      }
+      const stat = await lstat(current);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Restore path contains an unsafe directory.');
+    }
+    return path.resolve(this.root, rel);
+  }
 
   async run(runId: number): Promise<void> {
     this.db.prepare("UPDATE file_audit_runs SET status='running' WHERE id=?").run(runId);
@@ -139,5 +234,19 @@ export class FileAudit {
         files.push({ rel, category, extension, kind, bytes: stat.size, modifiedAt: stat.mtimeMs });
       }
     }
+  }
+
+  private isManagedPath(rel: string): boolean {
+    return typeof rel === 'string'
+      && rel.length > 0
+      && !rel.includes('\\')
+      && !rel.includes('\0')
+      && !path.posix.isAbsolute(rel)
+      && rel.split('/').every(part => part !== '' && part !== '.' && part !== '..')
+      && this.categories.some(category => rel.startsWith(`${category}/`));
+  }
+
+  private categoryFor(rel: string): string {
+    return this.categories.find(category => rel.startsWith(`${category}/`))!;
   }
 }

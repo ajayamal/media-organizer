@@ -3,6 +3,7 @@ import test from 'node:test';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { FileAudit, classifyFile } from '../src/services/file-audit.js';
 
 function createDatabase() {
@@ -74,4 +75,28 @@ test('hashes only same-size candidates and reports exact duplicate content', asy
   assert.equal(files.get('movies/Movies/poster.jpg')?.kind, 'artwork');
   assert.equal(files.get('movies/Movies/unclassified.bin')?.kind, 'other');
   assert.equal(String(runState.sql).includes("status='completed'"), true);
+});
+
+test('verifies cleanup candidates and quarantine files by exact hash', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'media-organizer-quarantine-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const rel = 'movies/Movies/Example/caption.srt';
+  const source = path.join(root, rel);
+  const contents = Buffer.from('subtitle contents');
+  await mkdir(path.dirname(source), { recursive: true });
+  await writeFile(source, contents);
+  await writeFile(path.join(path.dirname(source), 'video.mkv'), contents);
+  const hash = createHash('sha256').update(contents).digest('hex');
+  const audit = new FileAudit({} as never, root, ['movies/Movies']);
+
+  const verified = await audit.verifyFile(rel, hash);
+  assert.equal(verified.bytes, contents.length);
+  await assert.rejects(audit.verifyFile(rel, '0'.repeat(64)), /contents changed/);
+  await assert.rejects(audit.verifyFile('movies/Movies/Example/video.mkv', hash), /Video files cannot be removed/);
+
+  const quarantineRel = audit.quarantinePath(7, rel);
+  await audit.ensureQuarantineDirectory(7);
+  await writeFile(quarantineRel, contents);
+  const quarantined = await audit.verifyQuarantineFile(path.relative(root, quarantineRel), hash);
+  assert.equal(quarantined.bytes, contents.length);
 });

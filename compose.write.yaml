@@ -1,5 +1,5 @@
-# Opt-in override. Use ONLY after reviewing read-only previews and taking a backup.
-# Requires host user/group permissions to rename media; see README.
+# Opt-in override. Use ONLY after reviewing proposals and taking a backup.
+# Enables approved renames and reversible duplicate quarantine; see README.
 services:
   organizer:
     environment:

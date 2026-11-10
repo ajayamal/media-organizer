@@ -5,13 +5,14 @@ A self-hosted React + TypeScript dashboard, Fastify API, SQLite inventory and re
 ## Safeguards and limitations
 
 - **Read-only by default:** the Docker media mounts use `:ro`, and `ENABLE_WRITES=false` independently disables changes.
-- **No deletion endpoint, no automatic bulk changes.** Each high-confidence rename requires an explicit confirmation. Ambiguous anime absolute-numbered episodes, extras, OVAs, and inconsistent season numbers are *review only*.
+- **No permanent-delete endpoint or automatic bulk changes.** Exact duplicate non-video files can be moved individually to a reversible quarantine after selecting a copy to keep and confirming the action. Each high-confidence rename also requires explicit confirmation. Ambiguous anime absolute-numbered episodes, extras, OVAs, and inconsistent season numbers are *review only*.
 - **No subtitle renaming yet.** Subtitles are left intact; do not apply a rename to a video with sidecar subtitles until this feature is added. Embedded subtitles are unaffected.
 - **TMDB matching is read-only.** It stores provider candidates, score explanations, and possible destinations in SQLite; it never changes media files. Matching results are not wired to a batch execution UI yet.
 - **Collision protection:** exclusive hard-link creation prevents overwriting a destination. Moves remain within the same underlying filesystem; the app rejects cross-filesystem hard links.
 - **Undo:** records successful operations in SQLite; undo fails safely if the old name is occupied or the renamed file is missing. A process crash between filesystem change and journal write can leave an unjournaled rename, so this is **best-effort rollback, not transactional backup**.
-- **File scanning:** the library scan recursively indexes video extensions and excludes symlink entries. The separate read-only File audit scans regular files in the configured media folders, skips symlinks, and never modifies files.
+- **File scanning:** the library scan recursively indexes video extensions and excludes symlink entries. The File audit scan also skips symlinks and does not change files; selected duplicate cleanup is a separate, explicit quarantine action.
 - **Duplicate detection:** the File audit first groups files by size, then streams SHA-256 only for files in repeated-size groups. Only identical hashes are reported as duplicates. Files changing during hashing are reported as errors and are not treated as verified duplicates.
+- **Duplicate cleanup:** after enabling write mode, select the copy to keep and explicitly confirm moving non-video duplicates into `.media-organizer-quarantine` under the media root. Cleanup rechecks the file hashes and never removes video files. The audit page offers a restore action; a restore is blocked if the original path is occupied or the quarantined content changed.
 - **Non-video inventory:** subtitles, artwork, metadata sidecars, and archives are listed. Other extensions are summarized by extension and count. macOS `._` files are included in audit results but remain preserved by the rename workflow.
 - **Security:** password login (scrypt), HTTP-only SameSite=Strict cookie, same-origin checks for writes, no Docker socket, no public port binding. No TLS built into app: use SSH tunnel or private HTTPS reverse proxy. No built-in login rate limiting; restrict access to trusted networks. Password must be >=16 characters.
 - **Not production-hardened against malicious local users who can mutate the same folders concurrently.** Use a dedicated trusted server and avoid concurrent renames from other programs.
@@ -61,9 +62,9 @@ Use **File audit** to run a separate read-only scan. It compares exact file cont
 4. Deploy. Portainer uses the image built on the same local Docker host. Use the SSH tunnel described above to access it.
 5. To update the image later, rebuild on the host and recreate the service using Portainer's redeploy/pull-disabled options or `docker compose up -d --force-recreate` if using CLI deployment. **Do not deploy both CLI Compose and Portainer stacks simultaneously**, since they use the same container name/port.
 
-## Enabling approved renames (later)
+## Enabling approved file changes
 
-**Do not enable write mode until you have reviewed the proposals and backed up the SQLite volume and important media metadata.** In particular, avoid applying renames to movies with external subtitle files in this MVP.
+**Do not enable write mode until you have reviewed the proposals and backed up the SQLite volume and important media metadata.** Write mode enables individually approved renames and moving verified duplicate non-video files into quarantine. It does not expose permanent file deletion.
 
 ### CLI Compose
 
@@ -72,7 +73,7 @@ cd /srv/apps/media-organizer
 docker compose -f compose.yaml -f compose.write.yaml up -d
 ```
 
-This overrides the media mounts to `:rw` and sets `ENABLE_WRITES=true`. Confirm `docker inspect media-organizer` shows the expected mounts. Approve only individual high-confidence proposals in the UI. The backend rechecks source size and destination existence before each rename.
+This overrides the media mounts to `:rw` and sets `ENABLE_WRITES=true`. Confirm `docker inspect media-organizer` shows the expected mounts. Approve only individual high-confidence proposals and individually confirmed duplicate quarantine actions in the UI. The backend rechecks file identity and destination existence before each action. Quarantined copies are stored under `/media/.media-organizer-quarantine` and can be restored from the File audit page.
 
 Return to read-only mode:
 
@@ -94,6 +95,9 @@ In the existing stack editor, explicitly change **both** media volume modes from
 - `POST /api/scan` — scan library (authenticated)
 - `POST /api/audit` — start an asynchronous read-only duplicate and non-video file audit (authenticated)
 - `GET /api/audit/:id` — get audit progress, exact duplicate groups, media-related files, and other-extension counts (authenticated)
+- `POST /api/audit/:id/quarantine` — quarantine selected verified non-video duplicates (authenticated, write mode required)
+- `GET /api/quarantine` — list files available to restore (authenticated)
+- `POST /api/quarantine/:id/restore` — restore a quarantined file to its original path (authenticated, write mode required)
 - `POST /api/metadata/match` — start an asynchronous metadata-matching run (requires `TMDB_READ_TOKEN`)
 - `GET /api/metadata/match/:id` — get run progress and its matching results (authenticated)
 - `GET /api/inventory` — inventory and proposals

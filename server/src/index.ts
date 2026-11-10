@@ -53,10 +53,17 @@ CREATE TABLE IF NOT EXISTS file_audit_runs (
 );
 CREATE TABLE IF NOT EXISTS file_audit_files (
  run_id INTEGER NOT NULL, rel TEXT NOT NULL, category TEXT NOT NULL, extension TEXT NOT NULL, kind TEXT NOT NULL,
- bytes INTEGER NOT NULL, sha256 TEXT, error TEXT, PRIMARY KEY (run_id,rel)
+ bytes INTEGER NOT NULL, sha256 TEXT, error TEXT, quarantined INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (run_id,rel)
+);
+CREATE TABLE IF NOT EXISTS file_quarantine (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, audit_run_id INTEGER NOT NULL, original_rel TEXT NOT NULL,
+ quarantine_rel TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL, bytes INTEGER NOT NULL, status TEXT NOT NULL,
+ error TEXT, created_at TEXT NOT NULL, restored_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_file_audit_hash ON file_audit_files(run_id,sha256);
 CREATE INDEX IF NOT EXISTS idx_file_audit_kind ON file_audit_files(run_id,kind,rel);`);
+const auditFileColumns=db.prepare('PRAGMA table_info(file_audit_files)').all() as Array<{name:string}>;
+if(!auditFileColumns.some(column=>column.name==='quarantined'))db.exec('ALTER TABLE file_audit_files ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0');
 const matchColumns=db.prepare('PRAGMA table_info(metadata_matches)').all() as Array<{name:string}>;
 if(!matchColumns.some(column=>column.name==='manual_correction'))db.exec('ALTER TABLE metadata_matches ADD COLUMN manual_correction INTEGER NOT NULL DEFAULT 0');
 if(!matchColumns.some(column=>column.name==='episode_title'))db.exec('ALTER TABLE metadata_matches ADD COLUMN episode_title TEXT');
@@ -295,8 +302,138 @@ async function verifiedPath(rel:string){
 }
 let scanning=false;
 let auditing=false;
+let quarantining=false;
+function updateAuditDuplicateSummary(runId:number){
+ const summary=db.prepare(`SELECT COUNT(*) AS groups,COALESCE(SUM(file_count),0) AS files FROM (
+  SELECT COUNT(*) AS file_count FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL AND quarantined=0
+  GROUP BY sha256 HAVING COUNT(*)>1
+ )`).get(runId) as {groups:number,files:number};
+ db.prepare('UPDATE file_audit_runs SET duplicate_groups=?,duplicate_files=? WHERE id=?')
+  .run(summary.groups,summary.files,runId);
+}
+app.post('/api/audit/:id/quarantine',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
+ if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; duplicate cleanup requires explicit write mode.',403);
+ if(scanning||auditing||quarantining)return error(reply,'A library scan, audit, or file cleanup is already running.',409);
+ const runId=Number(req.params?.id);
+ if(!Number.isSafeInteger(runId)||runId<1)return error(reply,'Invalid file audit run id.');
+ const run=db.prepare('SELECT status FROM file_audit_runs WHERE id=?').get(runId) as {status:string}|undefined;
+ if(!run)return error(reply,'File audit run not found.',404);
+ if(run.status!=='completed')return error(reply,'Wait for the file audit to complete before cleaning up duplicates.',409);
+ const {keepRel,removeRels}=req.body||{};
+ if(typeof keepRel!=='string'||!Array.isArray(removeRels)||removeRels.length===0
+  ||removeRels.length>100||!removeRels.every((rel:unknown)=>typeof rel==='string')
+  ||new Set(removeRels).size!==removeRels.length||removeRels.includes(keepRel)){
+  return error(reply,'Select one copy to keep and between 1 and 100 non-video copies to quarantine.');
+ }
+ const keep=db.prepare(`SELECT sha256,kind FROM file_audit_files WHERE run_id=? AND rel=? AND quarantined=0 AND sha256 IS NOT NULL`)
+  .get(runId,keepRel) as {sha256:string,kind:string}|undefined;
+ if(!keep)return error(reply,'The selected copy is not part of this verified duplicate group. Run the audit again.',409);
+ const files=(removeRels as string[]).map(rel=>db.prepare(`SELECT sha256,kind,bytes FROM file_audit_files
+  WHERE run_id=? AND rel=? AND quarantined=0 AND sha256 IS NOT NULL`).get(runId,rel) as {sha256:string,kind:string,bytes:number}|undefined);
+ if(files.some(file=>!file||file.sha256!==keep.sha256||file.kind==='video')){
+  return error(reply,'Only verified identical non-video copies can be quarantined. Run the audit again.',409);
+ }
+ quarantining=true;
+ try{
+  const verified=[];
+  try{
+   for(let index=0;index<removeRels.length;index++){
+    const rel=removeRels[index] as string;
+    const file=files[index]!;
+    const source=await fileAudit.verifyFile(rel,keep.sha256);
+    const target=fileAudit.quarantinePath(runId,rel);
+    try{await fs.lstat(target);return error(reply,`Quarantine destination already exists for ${rel}.`,409);}
+    catch(e:any){if(e.code!=='ENOENT')throw e;}
+    verified.push({rel,bytes:source.bytes,device:source.device,inode:source.inode,target,source:source.absolutePath});
+   }
+   await fileAudit.ensureQuarantineDirectory(runId);
+  }catch(e){
+   return error(reply,e instanceof Error?e.message:'Unable to verify selected files.',409);
+  }
+  const moved:string[]=[];
+  const failures:Array<{rel:string,error:string}>=[];
+  for(const file of verified){
+   const now=new Date().toISOString();
+   const info=db.prepare(`INSERT INTO file_quarantine
+    (audit_run_id,original_rel,quarantine_rel,sha256,bytes,status,created_at)
+    VALUES (?,?,?,?,?,'moving',?)`).run(runId,file.rel,path.relative(ROOT,file.target).split(path.sep).join('/'),keep.sha256,file.bytes,now);
+   const quarantineId=Number(info.lastInsertRowid);
+   let linked=false;
+   let sourceRemoved=false;
+   try{
+    const sourceBefore=await fs.lstat(file.source);
+    if(!sourceBefore.isFile()||sourceBefore.isSymbolicLink()||sourceBefore.dev!==file.device||sourceBefore.ino!==file.inode){
+     throw new Error('Source file changed after verification; run the audit again.');
+    }
+    await fs.link(file.source,file.target);
+    linked=true;
+    const quarantineRel=path.relative(ROOT,file.target).split(path.sep).join('/');
+    const quarantined=await fileAudit.verifyQuarantineFile(quarantineRel,keep.sha256);
+    const sourceAfter=await fs.lstat(file.source);
+    if(sourceAfter.dev!==quarantined.device||sourceAfter.ino!==quarantined.inode){
+     throw new Error('Source file changed during quarantine; original was left in place.');
+    }
+    await fs.unlink(file.source);
+    sourceRemoved=true;
+    db.prepare('UPDATE file_quarantine SET status=\'quarantined\' WHERE id=?').run(quarantineId);
+    db.prepare('UPDATE file_audit_files SET quarantined=1 WHERE run_id=? AND rel=?').run(runId,file.rel);
+    moved.push(file.rel);
+   }catch(e){
+    if(linked&&!sourceRemoved)await fs.unlink(file.target).catch(cleanupError=>{
+     req.log.error({err:cleanupError,rel:file.rel},'Failed to remove incomplete quarantine link');
+    });
+    const message=e instanceof Error?e.message:'Unable to quarantine file.';
+    if(sourceRemoved){
+     db.prepare("UPDATE file_quarantine SET status='quarantined',error=? WHERE id=?").run(message,quarantineId);
+     db.prepare('UPDATE file_audit_files SET quarantined=1 WHERE run_id=? AND rel=?').run(runId,file.rel);
+     moved.push(file.rel);
+     failures.push({rel:file.rel,error:`Moved to quarantine, but status recording reported: ${message}`});
+     continue;
+    }
+    db.prepare('UPDATE file_quarantine SET status=\'failed\',error=? WHERE id=?').run(message,quarantineId);
+    failures.push({rel:file.rel,error:message});
+   }
+  }
+  updateAuditDuplicateSummary(runId);
+  return {moved,failures};
+ }finally{quarantining=false;}
+});
+app.post('/api/quarantine/:id/restore',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
+ if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; restoring quarantined files requires explicit write mode.',403);
+ if(scanning||auditing||quarantining)return error(reply,'A library scan, audit, or file cleanup is already running.',409);
+ const id=Number(req.params?.id);
+ if(!Number.isSafeInteger(id)||id<1)return error(reply,'Invalid quarantine record id.');
+ const item=db.prepare('SELECT * FROM file_quarantine WHERE id=?').get(id) as any;
+ if(!item||!['quarantined','moving'].includes(item.status))return error(reply,'Quarantined file is not available to restore.',404);
+ quarantining=true;
+ try{
+  try{
+   const source=await fileAudit.verifyQuarantineFile(item.quarantine_rel,item.sha256);
+   const target=await fileAudit.ensureRestoreDirectory(item.original_rel);
+   try{await fs.lstat(target);return error(reply,'Original path is already occupied; restore was not performed.',409);}
+   catch(e:any){if(e.code!=='ENOENT')throw e;}
+   db.prepare("UPDATE file_quarantine SET status='restoring',error=NULL WHERE id=?").run(id);
+   await fs.link(source.absolutePath,target);
+   const restored=await fs.lstat(target);
+   const quarantineAfter=await fs.lstat(source.absolutePath);
+   if(restored.dev!==source.device||restored.ino!==source.inode
+    ||quarantineAfter.dev!==restored.dev||quarantineAfter.ino!==restored.ino){
+    await fs.unlink(target).catch(()=>{});
+    throw new Error('Quarantined file changed during restore; no file was removed.');
+   }
+   try{await fs.unlink(source.absolutePath);}catch(e){await fs.unlink(target).catch(()=>{});throw e;}
+   db.prepare("UPDATE file_quarantine SET status='restored',restored_at=? WHERE id=?").run(new Date().toISOString(),id);
+   db.prepare('UPDATE file_audit_files SET quarantined=0 WHERE run_id=? AND rel=?').run(item.audit_run_id,item.original_rel);
+   updateAuditDuplicateSummary(item.audit_run_id);
+   return {ok:true,originalRel:item.original_rel};
+  }catch(e){
+   req.log.error({err:e,id},'Failed to restore quarantined file');
+   return error(reply,e instanceof Error?e.message:'Unable to restore quarantined file.',409);
+  }
+ }finally{quarantining=false;}
+});
 app.post('/api/audit',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
- if(scanning||auditing)return reply.code(409).send({error:'A library scan or file audit is already running.'});
+ if(scanning||auditing||quarantining)return reply.code(409).send({error:'A library scan, audit, or file cleanup is already running.'});
  const startedAt=new Date().toISOString();
  const info=db.prepare("INSERT INTO file_audit_runs (status,started_at) VALUES ('queued',?)").run(startedAt);
  const runId=Number(info.lastInsertRowid);
@@ -321,10 +458,10 @@ app.get('/api/audit/:id',{preHandler:requireAuth},async(req:any,reply)=>{
  if(!run)return reply.code(404).send({error:'File audit run not found.'});
  if(run.status!=='completed')return {run,duplicateGroups:[],mediaRelatedFiles:[],otherTypes:[],hashErrors:[]};
  const duplicateGroups=db.prepare(`SELECT sha256 AS hash,MIN(bytes) AS bytes,COUNT(*) AS count
-  FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL GROUP BY sha256 HAVING COUNT(*)>1
+  FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL AND quarantined=0 GROUP BY sha256 HAVING COUNT(*)>1
   ORDER BY bytes DESC,hash LIMIT 500`).all(id) as Array<{hash:string,bytes:number,count:number}>;
  const duplicates=db.prepare(`SELECT rel,category,kind,bytes,sha256 AS hash FROM file_audit_files
-  WHERE run_id=? AND sha256 IN (SELECT sha256 FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL
+  WHERE run_id=? AND quarantined=0 AND sha256 IN (SELECT sha256 FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL AND quarantined=0
    GROUP BY sha256 HAVING COUNT(*)>1 ORDER BY MIN(bytes) DESC,sha256 LIMIT 500)
   ORDER BY sha256,rel LIMIT 5000`).all(id,id) as Array<{rel:string,category:string,kind:string,bytes:number,hash:string}>;
  const duplicateMap=new Map<string,{hash:string,bytes:number,count:number,files:Array<{rel:string,category:string,kind:string}>}>();
@@ -337,8 +474,13 @@ app.get('/api/audit/:id',{preHandler:requireAuth},async(req:any,reply)=>{
  const hashErrors=db.prepare('SELECT rel,error FROM file_audit_files WHERE run_id=? AND error IS NOT NULL ORDER BY rel LIMIT 200').all(id);
  return {run,duplicateGroups:[...duplicateMap.values()],mediaRelatedFiles,otherTypes,hashErrors};
 });
+app.get('/api/quarantine',{preHandler:requireAuth},async()=>({
+ items:db.prepare(`SELECT id,audit_run_id AS auditRunId,original_rel AS originalRel,quarantine_rel AS quarantineRel,
+  bytes,status,error,created_at AS createdAt FROM file_quarantine WHERE status IN ('quarantined','moving','failed')
+  ORDER BY id DESC`).all(),
+}));
 app.post('/api/scan',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
- if(scanning||auditing)return reply.code(409).send({error:'A library scan or file audit is already running.'});
+ if(scanning||auditing||quarantining)return reply.code(409).send({error:'A library scan, audit, or file cleanup is already running.'});
  scanning=true;
  try{
   const rows:Array<{id:string,rel:string,bytes:number,category:string,issue:string,proposal:string|null,confidence:string,scanned_at:string}>=[];
