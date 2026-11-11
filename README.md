@@ -31,7 +31,7 @@ cd /srv/apps/media-organizer
 cp .env.example .env
 nano .env # Set a unique strong ADMIN_PASSWORD (>=16 characters)
 # Set TMDB_READ_TOKEN to enable server-side metadata matching.
-# Optionally configure a reachable OpenAI-compatible LM Studio API for uncertain title matches.
+# Optionally configure a reachable OpenAI-compatible LM Studio API for title parsing.
 chmod 600 .env
 docker compose up -d --build
 docker compose logs -f organizer
@@ -49,7 +49,7 @@ Click **Scan library**, review results. Scanning may take some time on large col
 
 ### Optional LM Studio matching assistance
 
-The matcher can use an OpenAI-compatible LM Studio server to suggest alternate title searches when deterministic TMDB matching is uncertain. TMDB remains the source of metadata and episode verification; AI-assisted candidates stay in review, and file renames still require individual approval. Only relative media paths and parsed title details are sent to LM Studio; media contents are never uploaded.
+When configured, the matcher asks an OpenAI-compatible LM Studio server to parse the canonical title and alternate title searches for each media folder, then compares those searches with TMDB. TMDB remains the source of metadata and episode verification; AI-assisted candidates stay in review and are not auto-renamed. Deterministic high-confidence results remain eligible for auto-apply only when explicitly enabled. Only relative media paths and parsed title details are sent to LM Studio; media contents are never uploaded.
 
 In LM Studio, load the desired model and start the Developer server with network access enabled. Configure the organizer with the endpoint reachable **from the organizer container** and the model ID reported by LM Studio:
 

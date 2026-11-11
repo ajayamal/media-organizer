@@ -173,11 +173,11 @@ export class MetadataMatcher {
     if (parsed.title) {
       for (const candidate of await searchTitles(parsed.title)) foundById.set(candidate.id, candidate);
     }
-    const initial = scoreCandidates(parsed, [...foundById.values()]);
     let assistedTitles: string[] = [];
     let aiError: string | undefined;
-    if (this.aiClient && initial.confidence !== 'high') {
-      const key = `${parsed.type}:${normalizeTitle(parsed.title)}:${parsed.year ?? ''}`;
+    if (this.aiClient) {
+      const directory = row.rel.slice(0, row.rel.lastIndexOf('/'));
+      const key = `${parsed.type}:${directory}:${normalizeTitle(parsed.title)}:${parsed.year ?? ''}`;
       let suggestions = aiTitleCache.get(key);
       if (!suggestions) {
         suggestions = this.aiClient.suggestSearchTitles(row.rel, parsed);

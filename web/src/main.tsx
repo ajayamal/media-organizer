@@ -951,8 +951,8 @@ function MetadataPanel({
         <div className="metadata-intro-copy">
           <h2>Match your library with TMDB</h2>
           <p>TMDB supplies metadata and verifies standard episode numbers. {aiMatchingEnabled
-            ? 'Local LM Studio AI suggests alternate search titles for uncertain matches; AI-assisted results remain in review.'
-            : 'Configure LM Studio to suggest alternate search titles for uncertain matches.'} {autoApplyHighConfidenceEnabled
+            ? 'Local LM Studio parses title searches for each media folder; TMDB validates the candidates, and AI-assisted results remain in review.'
+            : 'Configure LM Studio to parse title searches before TMDB matching.'} {autoApplyHighConfidenceEnabled
               ? 'Deterministic high-confidence matches will be renamed automatically; AI-assisted matches remain in review and manually corrected matches are never auto-renamed.'
               : 'Matching does not rename files unless high-confidence auto-apply is explicitly enabled in the server configuration.'}</p>
         </div>

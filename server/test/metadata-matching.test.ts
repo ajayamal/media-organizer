@@ -97,6 +97,37 @@ test('detects conflict between filename season and containing season folder', ()
   assert.equal(parsed.folderSeason, 2);
 });
 
+test('parses enhanced Samurai Champloo release with an Episode number and season folder', () => {
+  const parsed = parseMediaPath(
+    'shows/Anime/Samurai Champloo (ENHANCED) [1080p] [DUAL-AUDIO] [x265] [HEVC] [AAC]/Season 1/[bonkai77].Samurai.Champloo.(ENHANCED).Episode.02.Redeye.Reprisal.1080p.Dual.Audio.Bluray [8A84792E].mkv',
+    'shows/Anime',
+  );
+  assert.equal(parsed.title, 'Samurai Champloo');
+  assert.equal(parsed.season, 1);
+  assert.equal(parsed.episode, 2);
+  assert.equal(parsed.episodeStyle, 'season-episode');
+
+  const result = scoreCandidates(parsed, [{
+    id: 1,
+    mediaType: 'tv',
+    title: 'Samurai Champloo',
+    originalTitle: 'Samurai Champloo',
+    year: 2004,
+    aliases: [],
+  }]);
+  assert.equal(result.confidence, 'high');
+  assert.equal(result.aiAssisted, false);
+});
+
+test('does not assume an Episode-tagged number is a season episode without a season folder', () => {
+  const parsed = parseMediaPath(
+    'shows/Anime/Samurai Champloo/Samurai Champloo Episode.02.mkv',
+    'shows/Anime',
+  );
+  assert.equal(parsed.episode, 2);
+  assert.equal(parsed.episodeStyle, 'absolute');
+});
+
 test('preserves AppleDouble files, specials, and extras', () => {
   for (const rel of [
     'movies/Anime/._metadata.mkv',

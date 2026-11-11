@@ -76,7 +76,7 @@ function cleanTitle(value: string): string {
   return value
     .replace(/^\[[^\]]+\]\s*/g, '')
     .replace(/\[[^\]]*]/g, ' ')
-    .replace(/\([^)]*(?:dual audio|multi audio|10bit|8bit|1080p|720p|x26[45]|bluray|web[- ]?dl)[^)]*\)/gi, ' ')
+    .replace(/\([^)]*(?:enhanced|dual audio|multi audio|10bit|8bit|1080p|720p|x26[45]|bluray|web[- ]?dl)[^)]*\)/gi, ' ')
     .replace(/[_\.]+/g, ' ')
     .replace(/\s*[-_]{2,}\s*/g, ' ')
     .replace(/\s+/g, ' ')
@@ -113,6 +113,7 @@ export function parseMediaPath(rel: string, category: string): ParsedMedia {
   }
 
   const seasonEpisode = stem.match(/\bS(\d{1,2})E(\d{1,3})\b/i);
+  const episodeTag = !seasonEpisode ? stem.match(/\bEpisode[ ._-]+(\d{1,3})\b/i) : undefined;
   const seasonFolder = parts.slice(0, -1).map(part => part.match(/^Season\s+(\d{1,2})$/i)).find(Boolean);
   const folderSeason = seasonFolder ? Number(seasonFolder[1]) : undefined;
   const absoluteEpisode = !seasonEpisode && type === 'tv'
@@ -133,8 +134,10 @@ export function parseMediaPath(rel: string, category: string): ParsedMedia {
       extension,
       seriesFolder,
       season: seasonEpisode ? Number(seasonEpisode[1]) : folderSeason,
-      episode: seasonEpisode ? Number(seasonEpisode[2]) : absoluteEpisode ? Number(absoluteEpisode[1]) : undefined,
-      episodeStyle: seasonEpisode ? 'season-episode' : absoluteEpisode ? 'absolute' : undefined,
+      episode: seasonEpisode ? Number(seasonEpisode[2]) : episodeTag ? Number(episodeTag[1]) : absoluteEpisode ? Number(absoluteEpisode[1]) : undefined,
+      episodeStyle: seasonEpisode || (episodeTag && folderSeason !== undefined)
+        ? 'season-episode'
+        : episodeTag || absoluteEpisode ? 'absolute' : undefined,
       folderSeason,
     };
   }
@@ -205,14 +208,16 @@ export function scoreCandidates(
     }))).sort((a, b) => b.similarity - a.similarity)[0];
     const similarity = best?.similarity ?? 0;
     const bestAlias = best?.alias || candidate.title;
-    const yearScore = parsed.year === undefined ? 8 : parsed.year === candidate.year ? 20 : 0;
+    const yearScore = parsed.year === undefined ? parsed.type === 'tv' ? 12 : 8 : parsed.year === candidate.year ? 20 : 0;
     const score = Math.max(0, Math.min(100, Math.round(similarity * 70 + yearScore + 10)));
     const explanations = [`Title similarity: ${Math.round(similarity * 100)}%${bestAlias !== candidate.title ? ` (matched alias “${bestAlias}”)` : ''}.`];
     const originalSimilarity = Math.max(0, ...aliases.map(alias => titleSimilarity(parsed.title, alias)));
     if (best && best.query !== parsed.title && best.similarity > originalSimilarity) {
       explanations.push(`LM Studio suggested the alternate search title “${best.query}”.`);
     }
-    if (parsed.year === undefined) explanations.push('No year was found in the file path.');
+    if (parsed.year === undefined) explanations.push(parsed.type === 'tv'
+      ? 'No series year was found; the exact series title is the primary match evidence.'
+      : 'No year was found in the file path.');
     else if (parsed.year === candidate.year) explanations.push(`Release year matches (${parsed.year}).`);
     else explanations.push(`Year mismatch: file says ${parsed.year}; provider says ${candidate.year ?? 'unknown'}.`);
     explanations.push('Media type matches the library category.');
