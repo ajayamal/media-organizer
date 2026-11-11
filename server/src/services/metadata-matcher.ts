@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 import {
   parseMediaPath,
   createMetadataProposal,
+  normalizeTitle,
   safeMetadataName,
   scoreCandidates,
   type Confidence,
@@ -9,6 +10,7 @@ import {
   type ParsedMedia,
 } from './metadata-matching.js';
 import { TmdbClient, TmdbError, type TmdbCandidate, type TmdbEpisode } from './tmdb.js';
+import { LmStudioClient } from './lm-studio.js';
 
 interface InventoryRow {
   id: string;
@@ -39,7 +41,11 @@ interface MetadataCorrection {
 export class MetadataMatcher {
   private readonly client: TmdbClient;
 
-  constructor(private readonly db: Database.Database, token: string) {
+  constructor(
+    private readonly db: Database.Database,
+    token: string,
+    private readonly aiClient: LmStudioClient | null = null,
+  ) {
     this.client = new TmdbClient(db, token);
   }
 
@@ -50,6 +56,7 @@ export class MetadataMatcher {
     this.db.prepare("UPDATE metadata_match_runs SET status='running',total=? WHERE id=?").run(rows.length, runId);
 
     const titleSearchCache = new Map<string, Promise<TmdbCandidate[]>>();
+    const aiTitleCache = new Map<string, Promise<string[]>>();
     let matched = 0;
     let review = 0;
     let unmatched = 0;
@@ -60,7 +67,7 @@ export class MetadataMatcher {
       const row = rows[index];
       let result: ReturnType<typeof this.makeRecord>;
       try {
-        result = await this.matchRow(row, titleSearchCache);
+        result = await this.matchRow(row, titleSearchCache, aiTitleCache);
       } catch (error) {
         if (error instanceof TmdbError && (error.statusCode === 401 || error.statusCode === 403)) throw error;
         errors++;
@@ -92,7 +99,11 @@ export class MetadataMatcher {
       .run(message, new Date().toISOString(), runId);
   }
 
-  private async matchRow(row: InventoryRow, searchCache: Map<string, Promise<TmdbCandidate[]>>) {
+  private async matchRow(
+    row: InventoryRow,
+    searchCache: Map<string, Promise<TmdbCandidate[]>>,
+    aiTitleCache: Map<string, Promise<string[]>>,
+  ) {
     const parsed = parseMediaPath(row.rel, row.category);
     if (parsed.preservedReason) {
       return this.makeRecord(row, parsed, { score: 0, confidence: 'preserved', candidates: [], explanations: [parsed.preservedReason] });
@@ -100,20 +111,49 @@ export class MetadataMatcher {
     const correction = this.db.prepare('SELECT * FROM metadata_corrections WHERE rel=? AND category=?')
       .get(row.rel, row.category) as MetadataCorrection | undefined;
     if (correction) return this.applyCorrection(row, parsed, correction);
-    if (!parsed.title) {
+    if (!parsed.title && !this.aiClient) {
       return this.makeRecord(row, parsed, { score: 0, confidence: 'unmatched', candidates: [], explanations: ['No reliable title could be extracted.'] });
     }
 
-    const cacheKey = `${parsed.type}:${parsed.title.toLowerCase()}`;
-    let search = searchCache.get(cacheKey);
-    if (!search) {
-      search = this.client.search(parsed.type, parsed.title);
-      searchCache.set(cacheKey, search);
+    const searchTitles = async (title: string): Promise<TmdbCandidate[]> => {
+      const cacheKey = `${parsed.type}:${normalizeTitle(title)}`;
+      let search = searchCache.get(cacheKey);
+      if (!search) {
+        search = this.client.search(parsed.type, title);
+        searchCache.set(cacheKey, search);
+      }
+      return search;
+    };
+    const foundById = new Map<number, TmdbCandidate>();
+    if (parsed.title) {
+      for (const candidate of await searchTitles(parsed.title)) foundById.set(candidate.id, candidate);
     }
-    const found = await search;
+    const initial = scoreCandidates(parsed, [...foundById.values()]);
+    let assistedTitles: string[] = [];
+    let aiError: string | undefined;
+    if (this.aiClient && initial.confidence !== 'high') {
+      const key = `${parsed.type}:${normalizeTitle(parsed.title)}:${parsed.year ?? ''}`;
+      let suggestions = aiTitleCache.get(key);
+      if (!suggestions) {
+        suggestions = this.aiClient.suggestSearchTitles(row.rel, parsed);
+        aiTitleCache.set(key, suggestions);
+      }
+      try {
+        assistedTitles = await suggestions;
+      } catch (error) {
+        aiError = error instanceof Error ? error.message : 'Unknown LM Studio error.';
+      }
+      for (const title of assistedTitles) {
+        if (normalizeTitle(title) === normalizeTitle(parsed.title)) continue;
+        try {
+          for (const candidate of await searchTitles(title)) foundById.set(candidate.id, candidate);
+        } catch (error) {
+          aiError = error instanceof Error ? error.message : 'TMDB search for an AI-suggested title failed.';
+        }
+      }
+    }
 
-    const firstPass = scoreCandidates(parsed, found);
-    const likely = firstPass.candidates.slice(0, 3);
+    const likely = scoreCandidates(parsed, [...foundById.values()], assistedTitles).candidates.slice(0, 3);
     const enriched = [];
     for (const candidate of likely) {
       try {
@@ -133,7 +173,11 @@ export class MetadataMatcher {
       year: candidate.year,
       aliases: candidate.aliases,
     }));
-    const scored = scoreCandidates(parsed, raw);
+    const scored = scoreCandidates(parsed, raw, assistedTitles);
+    if (assistedTitles.length > 0) {
+      scored.explanations.push(`LM Studio supplied additional title search terms: ${assistedTitles.join(', ')}.`);
+    }
+    if (aiError) scored.explanations.push(`LM Studio assistance was incomplete; deterministic matching was retained: ${aiError}`);
     if (!scored.candidate) {
       return this.makeRecord(row, parsed, scored);
     }

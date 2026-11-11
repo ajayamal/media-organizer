@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MetadataMatcher } from '../src/services/metadata-matcher.js';
+import { LmStudioClient } from '../src/services/lm-studio.js';
 
-function createDatabase(correction?: Record<string, unknown>) {
+function createDatabase(correction?: Record<string, unknown>, inventoryOverride?: { id: string; rel: string; category: string }) {
   const bindings: Array<Record<string, unknown>> = [];
-  const inventory = {
+  const inventory = inventoryOverride ?? {
     id: 'movie-1',
     rel: 'movies/Movies/Example (2020)/Example.mkv',
     category: 'movies/Movies',
@@ -62,6 +63,42 @@ test('binds correction flags as SQLite integers', async () => {
     });
     await new MetadataMatcher(corrected.db as never, '').run(1);
     assert.equal(corrected.bindings[0].manualCorrection, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('uses LM Studio title suggestions to recover uncertain matches without auto-approving them', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/chat/completions')) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"titles":["Example"]}' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.pathname.endsWith('/alternative_titles')) {
+      return new Response(JSON.stringify({ titles: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const query = url.searchParams.get('query');
+    const results = query === 'Example'
+      ? [{ id: 1, title: 'Example', original_title: 'Example', release_date: '2020-01-01' }]
+      : [];
+    return new Response(JSON.stringify({ results }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = createDatabase(undefined, {
+      id: 'movie-1',
+      rel: 'movies/Movies/Mysterious Film (2020)/Mysterious Film.mkv',
+      category: 'movies/Movies',
+    });
+    const ai = new LmStudioClient('http://127.0.0.1:1234/v1', 'test-model');
+    await new MetadataMatcher(result.db as never, 'test-token', ai).run(1);
+    assert.equal(result.bindings[0].title, 'Example');
+    assert.equal(result.bindings[0].confidence, 'medium');
+    assert.equal(result.bindings[0].matchStatus, 'review');
+    assert.ok(String(result.bindings[0].explanations).includes('LM Studio'));
   } finally {
     globalThis.fetch = originalFetch;
   }

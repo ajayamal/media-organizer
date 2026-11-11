@@ -169,6 +169,7 @@ function App() {
   const [authed, setAuthed] = useState(false);
   const [password, setPassword] = useState('');
   const [writes, setWrites] = useState(false);
+  const [aiMatchingEnabled, setAiMatchingEnabled] = useState(false);
   const [items, setItems] = useState<Item[]>([]);
   const [ops, setOps] = useState<Op[]>([]);
   const [query, setQuery] = useState('');
@@ -201,10 +202,11 @@ function App() {
   };
 
   useEffect(() => {
-    api<{ authenticated: boolean; writesEnabled: boolean }>('/status')
+    api<{ authenticated: boolean; writesEnabled: boolean; aiMatchingEnabled: boolean }>('/status')
       .then(status => {
         setAuthed(status.authenticated);
         setWrites(status.writesEnabled);
+        setAiMatchingEnabled(status.aiMatchingEnabled);
         if (status.authenticated) load().catch(error => setMsg(error.message));
       })
       .catch(error => setMsg(error.message));
@@ -572,6 +574,7 @@ function App() {
             filter={matchFilter}
             progress={progress}
             error={matchError}
+            aiMatchingEnabled={aiMatchingEnabled}
             runId={matchRun?.id ?? null}
             onStart={startMatching}
             onFilter={setMatchFilter}
@@ -898,6 +901,7 @@ function auditStatusLabel(status: AuditRun['status']): string {
 
 function MetadataPanel({
   itemsCount,
+  aiMatchingEnabled,
   matchRun,
   matchingActive,
   matchingBusy,
@@ -912,6 +916,7 @@ function MetadataPanel({
   onSaveCorrection,
 }: {
   itemsCount: number;
+  aiMatchingEnabled: boolean;
   matchRun: MatchRun | null;
   matchingActive: boolean;
   matchingBusy: boolean;
@@ -934,7 +939,9 @@ function MetadataPanel({
         <div className="metadata-intro-icon"><Database size={21} /></div>
         <div className="metadata-intro-copy">
           <h2>Match your library with TMDB</h2>
-          <p>Matching looks up movie and series metadata, scores candidate titles, and verifies standard episode numbers. It never renames or modifies media files.</p>
+          <p>TMDB supplies metadata and verifies standard episode numbers. {aiMatchingEnabled
+            ? 'Local LM Studio AI suggests alternate search titles for uncertain matches; AI-assisted results remain in review.'
+            : 'Configure LM Studio to suggest alternate search titles for uncertain matches.'} Matching never renames or modifies media files.</p>
         </div>
         <button className="primary" disabled={matchingActive || matchingBusy || itemsCount === 0} onClick={onStart}>
           <Sparkles size={16} />{matchingBusy ? 'Starting...' : matchingActive ? 'Matching...' : matchRun ? 'Run matching again' : 'Start matching'}

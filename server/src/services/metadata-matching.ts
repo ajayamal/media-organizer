@@ -185,21 +185,32 @@ export function titleSimilarity(left: string, right: string): number {
 export function scoreCandidates(
   parsed: ParsedMedia,
   candidates: Array<Omit<MetadataCandidate, 'score' | 'titleSimilarity' | 'explanations' | 'ambiguous'>>,
+  assistedTitles: string[] = [],
 ): ScoredMatch {
   if (parsed.preservedReason) {
     return { candidates: [], score: 0, confidence: 'preserved', explanations: [parsed.preservedReason] };
   }
-  if (!parsed.title) {
+  if (!parsed.title && assistedTitles.length === 0) {
     return { candidates: [], score: 0, confidence: 'unmatched', explanations: ['No reliable title could be extracted.'] };
   }
 
   const ranked = candidates.map(candidate => {
     const aliases = [...new Set([candidate.title, candidate.originalTitle, ...candidate.aliases].filter(Boolean))];
-    const similarity = Math.max(0, ...aliases.map(alias => titleSimilarity(parsed.title, alias)));
-    const bestAlias = aliases.find(alias => titleSimilarity(parsed.title, alias) === similarity) || candidate.title;
+    const titleQueries = [parsed.title, ...assistedTitles];
+    const best = aliases.flatMap(alias => titleQueries.map(query => ({
+      alias,
+      query,
+      similarity: titleSimilarity(query, alias),
+    }))).sort((a, b) => b.similarity - a.similarity)[0];
+    const similarity = best?.similarity ?? 0;
+    const bestAlias = best?.alias || candidate.title;
     const yearScore = parsed.year === undefined ? 8 : parsed.year === candidate.year ? 20 : 0;
     const score = Math.max(0, Math.min(100, Math.round(similarity * 70 + yearScore + 10)));
     const explanations = [`Title similarity: ${Math.round(similarity * 100)}%${bestAlias !== candidate.title ? ` (matched alias “${bestAlias}”)` : ''}.`];
+    const originalSimilarity = Math.max(0, ...aliases.map(alias => titleSimilarity(parsed.title, alias)));
+    if (best && best.query !== parsed.title && best.similarity > originalSimilarity) {
+      explanations.push(`LM Studio suggested the alternate search title “${best.query}”.`);
+    }
     if (parsed.year === undefined) explanations.push('No year was found in the file path.');
     else if (parsed.year === candidate.year) explanations.push(`Release year matches (${parsed.year}).`);
     else explanations.push(`Year mismatch: file says ${parsed.year}; provider says ${candidate.year ?? 'unknown'}.`);
@@ -219,9 +230,19 @@ export function scoreCandidates(
   }
   const best = ranked[0];
   const yearConflict = parsed.year !== undefined && best.year !== undefined && parsed.year !== best.year;
-  const confidence: Confidence = ambiguous || yearConflict || parsed.episodeStyle === 'absolute'
+  let confidence: Confidence = ambiguous || yearConflict || parsed.episodeStyle === 'absolute'
     ? best.score >= 70 ? 'medium' : 'low'
     : best.score >= 90 ? 'high' : best.score >= 70 ? 'medium' : 'low';
+  const originalSimilarity = Math.max(0, ...[best.title, best.originalTitle, ...best.aliases]
+    .filter(Boolean)
+    .map(alias => titleSimilarity(parsed.title, alias)));
+  const aiAssisted = assistedTitles.some(title => titleSimilarity(title, best.title) > originalSimilarity
+    || titleSimilarity(title, best.originalTitle) > originalSimilarity
+    || best.aliases.some(alias => titleSimilarity(title, alias) > originalSimilarity));
+  if (aiAssisted && confidence === 'high') {
+    confidence = 'medium';
+    best.explanations.push('This match relied on an AI-suggested title and remains in review for confirmation.');
+  }
   if (yearConflict) best.explanations.push('Year mismatch blocks high-confidence approval.');
   if (parsed.episodeStyle === 'absolute') best.explanations.push('Absolute episode numbering has no verified season mapping.');
   return {

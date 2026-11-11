@@ -59,6 +59,15 @@ test('marks similarly scored metadata candidates ambiguous', () => {
   assert.equal(result.confidence, 'medium');
 });
 
+test('keeps AI-assisted title matches in review instead of assigning high confidence', () => {
+  const parsed = parseMediaPath('movies/Movies/Mysterious Film (2020)/movie.mkv', 'movies/Movies');
+  const result = scoreCandidates(parsed, [{
+    id: 1, mediaType: 'movie', title: 'Example', originalTitle: 'Example', year: 2020, aliases: [],
+  }], ['Example']);
+  assert.equal(result.confidence, 'medium');
+  assert.ok(result.explanations.some(explanation => explanation.includes('AI-suggested title')));
+});
+
 test('keeps absolute episode numbering for review instead of inventing a season', () => {
   const parsed = parseMediaPath(
     'shows/Anime/Akame ga Kill!/Akame ga Kill! - 17.mkv',

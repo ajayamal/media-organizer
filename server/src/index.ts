@@ -7,6 +7,7 @@ import { promises as fs, constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MetadataMatcher } from './services/metadata-matcher.js';
+import { LmStudioClient } from './services/lm-studio.js';
 import { FileAudit } from './services/file-audit.js';
 import { TmdbClient } from './services/tmdb.js';
 import { createMetadataProposal, parseMediaPath, safeMetadataName } from './services/metadata-matching.js';
@@ -75,7 +76,13 @@ db.prepare("UPDATE file_audit_runs SET status='failed',error='Server restarted b
  .run(new Date().toISOString());
 const app = Fastify({logger:true, bodyLimit:64*1024, trustProxy:false});
 await app.register(cookie);
-const metadataMatcher = new MetadataMatcher(db, process.env.TMDB_READ_TOKEN || '');
+const lmStudioBaseUrl = process.env.LM_STUDIO_BASE_URL?.trim() || '';
+const lmStudioModel = process.env.LM_STUDIO_MODEL?.trim() || '';
+if (Boolean(lmStudioBaseUrl) !== Boolean(lmStudioModel)) {
+  throw new Error('Configure both LM_STUDIO_BASE_URL and LM_STUDIO_MODEL, or leave both unset.');
+}
+const lmStudioClient = lmStudioBaseUrl ? new LmStudioClient(lmStudioBaseUrl, lmStudioModel) : null;
+const metadataMatcher = new MetadataMatcher(db, process.env.TMDB_READ_TOKEN || '', lmStudioClient);
 const fileAudit = new FileAudit(db, ROOT, categories);
 const tmdbClient = new TmdbClient(db, process.env.TMDB_READ_TOKEN || '');
 app.addHook('onRequest', async (req, reply) => {
@@ -116,7 +123,7 @@ app.post('/api/logout',{preHandler:[requireOrigin,requireAuth]},async(req:any,re
  if(req.cookies.mo_session) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(sha(req.cookies.mo_session));
  reply.clearCookie('mo_session',{path:'/'});return {ok:true};
 });
-app.get('/api/status',async(req,reply)=>({authenticated:auth(req),writesEnabled:WRITE_ENABLED}));
+app.get('/api/status',async(req,reply)=>({authenticated:auth(req),writesEnabled:WRITE_ENABLED,aiMatchingEnabled:lmStudioClient!==null}));
 app.post('/api/metadata/match',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
  if(!process.env.TMDB_READ_TOKEN?.trim())return reply.code(503).send({error:'Metadata matching is unavailable: TMDB_READ_TOKEN is not configured.'});
  const active=db.prepare("SELECT id FROM metadata_match_runs WHERE status IN ('queued','running') LIMIT 1").get() as {id:number}|undefined;

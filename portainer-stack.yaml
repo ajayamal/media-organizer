@@ -10,6 +10,8 @@ services:
     environment:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       TMDB_READ_TOKEN: ${TMDB_READ_TOKEN:-}
+      LM_STUDIO_BASE_URL: ${LM_STUDIO_BASE_URL:-}
+      LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:-}
       ENABLE_WRITES: "false"
       COOKIE_SECURE: "false"
       MEDIA_ROOT: /media

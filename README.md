@@ -7,7 +7,7 @@ A self-hosted React + TypeScript dashboard, Fastify API, SQLite inventory and re
 - **Read-only by default:** the Docker media mounts use `:ro`, and `ENABLE_WRITES=false` independently disables changes.
 - **No permanent-delete endpoint or automatic bulk changes.** Exact duplicate non-video files can be moved individually to a reversible quarantine after selecting a copy to keep and confirming the action. Each high-confidence rename also requires explicit confirmation. Ambiguous anime absolute-numbered episodes, extras, OVAs, and inconsistent season numbers are *review only*.
 - **No subtitle renaming yet.** Subtitles are left intact; do not apply a rename to a video with sidecar subtitles until this feature is added. Embedded subtitles are unaffected.
-- **TMDB matching is read-only.** It stores provider candidates, score explanations, and possible destinations in SQLite; it never changes media files. Matching results are not wired to a batch execution UI yet.
+- **Metadata matching is read-only.** TMDB supplies provider candidates and episode data; optional LM Studio assistance suggests alternate title searches only for uncertain matches. AI-assisted results remain in review and never rename files automatically.
 - **Collision protection:** exclusive hard-link creation prevents overwriting a destination. Moves remain within the same underlying filesystem; the app rejects cross-filesystem hard links.
 - **Undo:** records successful operations in SQLite; undo fails safely if the old name is occupied or the renamed file is missing. A process crash between filesystem change and journal write can leave an unjournaled rename, so this is **best-effort rollback, not transactional backup**.
 - **File scanning:** the library scan recursively indexes video extensions and excludes symlink entries. The File audit scan also skips symlinks and does not change files; selected duplicate cleanup is a separate, explicit quarantine action.
@@ -30,7 +30,8 @@ cd /srv/apps
 cd /srv/apps/media-organizer
 cp .env.example .env
 nano .env # Set a unique strong ADMIN_PASSWORD (>=16 characters)
-# Optionally set TMDB_READ_TOKEN to enable server-side metadata matching.
+# Set TMDB_READ_TOKEN to enable server-side metadata matching.
+# Optionally configure a reachable OpenAI-compatible LM Studio API for uncertain title matches.
 chmod 600 .env
 docker compose up -d --build
 docker compose logs -f organizer
@@ -46,6 +47,19 @@ Keep the SSH session open, then visit `http://localhost:3100` on that PC. This k
 
 Click **Scan library**, review results. Scanning may take some time on large collections.
 
+### Optional LM Studio matching assistance
+
+The matcher can use an OpenAI-compatible LM Studio server to suggest alternate title searches when deterministic TMDB matching is uncertain. TMDB remains the source of metadata and episode verification; AI-assisted candidates stay in review, and file renames still require individual approval. Only relative media paths and parsed title details are sent to LM Studio; media contents are never uploaded.
+
+In LM Studio, load the desired model and start the Developer server with network access enabled. Configure the organizer with the endpoint reachable **from the organizer container** and the model ID reported by LM Studio:
+
+```dotenv
+LM_STUDIO_BASE_URL=http://192.168.0.110:1234/v1
+LM_STUDIO_MODEL=Qwen3.6 14B A3B FableVibes
+```
+
+Allow inbound access to LM Studio's API port only from the organizer host on your trusted private network; do not expose it to the public internet. Restart/redeploy the organizer after changing these settings. Both variables must be set together. If LM Studio is unreachable or returns invalid suggestions, the run continues with deterministic TMDB matching and records the fallback reason in the result explanation. With AI unset, existing matching behavior is unchanged.
+
 Use **File audit** to run a separate read-only scan. It compares exact file contents for same-size candidates using SHA-256, lists common media sidecars (such as subtitles, artwork, metadata, and archives), and summarizes other extensions. Responses include up to 500 duplicate groups, 5,000 duplicate paths, and 2,000 non-video files; summary counts include the full scan.
 
 ## Portainer deployment
@@ -58,7 +72,7 @@ Use **File audit** to run a separate read-only scan. It compares exact file cont
    ```
 
 2. In Portainer, select the **local** Docker environment, then **Stacks > Add stack > Web editor**. Name it `media-organizer`.
-3. Paste the contents of `portainer-stack.yaml`. Add the environment variable `ADMIN_PASSWORD` in Portainer's stack environment variables section (strong, unique password, >=16 characters). Do not paste the password into the YAML.
+3. Paste the contents of `portainer-stack.yaml`. Add the environment variable `ADMIN_PASSWORD` in Portainer's stack environment variables section (strong, unique password, >=16 characters). To enable LM Studio, also add `LM_STUDIO_BASE_URL` and `LM_STUDIO_MODEL`. Do not paste the admin password into the YAML.
 4. Deploy. Portainer uses the image built on the same local Docker host. Use the SSH tunnel described above to access it.
 5. To update the image later, rebuild on the host and recreate the service using Portainer's redeploy/pull-disabled options or `docker compose up -d --force-recreate` if using CLI deployment. **Do not deploy both CLI Compose and Portainer stacks simultaneously**, since they use the same container name/port.
 
