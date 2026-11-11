@@ -223,6 +223,7 @@ export class FileAudit {
   private async walk(directory: string, category: string, files: AuditFile[]): Promise<void> {
     const entries = await readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
+      if (category === 'storage' && entry.name.startsWith('.')) continue;
       const full = path.join(directory, entry.name);
       const stat = await lstat(full);
       if (stat.isSymbolicLink()) continue;

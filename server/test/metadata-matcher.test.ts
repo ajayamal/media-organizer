@@ -243,3 +243,87 @@ test('uses LM Studio title suggestions to recover uncertain matches without auto
     globalThis.fetch = originalFetch;
   }
 });
+
+test('keeps HDD proposals review-only and never calls the automatic rename callback', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async input => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/chat/completions')) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"mediaType":"movie","titles":["Example"],"season":null,"episode":null}' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.pathname.endsWith('/alternative_titles')) {
+      return new Response(JSON.stringify({ titles: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      results: [{ id: 1, title: 'Example', original_title: 'Example', release_date: '2020-01-01' }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  try {
+    const result = createDatabase(undefined, {
+      id: 'storage-movie-1',
+      rel: 'storage/Unsorted/Example.2020.1080p.mkv',
+      category: 'storage',
+    });
+    const ai = new LmStudioClient('http://127.0.0.1:1234/v1', 'test-model');
+    let autoApplyCalls = 0;
+    await new MetadataMatcher(result.db as never, 'test-token', ai, async () => {
+      autoApplyCalls++;
+      return { ok: true, inventoryId: 'unexpected', rel: 'unexpected' };
+    }).run(1);
+    assert.equal(result.bindings[0].rel, 'storage/Unsorted/Example.2020.1080p.mkv');
+    assert.equal(result.bindings[0].confidence, 'medium');
+    assert.equal(result.bindings[0].matchStatus, 'review');
+    assert.equal(result.bindings[0].aiAssisted, 1);
+    assert.equal(result.bindings[0].proposedRel, 'storage/Movies/Example (2020)/Example (2020).mkv');
+    assert.equal(autoApplyCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('uses explicit HDD season and episode evidence and validates the episode with TMDB', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async input => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith('/chat/completions')) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: '{"mediaType":"tv","titles":["Samurai Champloo"],"season":9,"episode":9}' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.pathname === '/3/search/tv') {
+      return new Response(JSON.stringify({
+        results: [{ id: 1, name: 'Samurai Champloo', original_name: 'Samurai Champloo', first_air_date: '2004-05-20' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.pathname === '/3/tv/1/alternative_titles') {
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.pathname === '/3/tv/1/season/1') {
+      return new Response(JSON.stringify({ episodes: [{ episode_number: 2, name: 'Redeye Reprisal' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`Unexpected TMDB request: ${url.pathname}`);
+  };
+
+  try {
+    const result = createDatabase(undefined, {
+      id: 'storage-tv-1',
+      rel: 'storage/Unsorted/Samurai Champloo/Season 1/Episode 02.mkv',
+      category: 'storage',
+    });
+    const ai = new LmStudioClient('http://127.0.0.1:1234/v1', 'test-model');
+    await new MetadataMatcher(result.db as never, 'test-token', ai).run(1);
+    assert.equal(result.bindings[0].season, 1);
+    assert.equal(result.bindings[0].episode, 2);
+    assert.equal(result.bindings[0].episodeTitle, 'Redeye Reprisal');
+    assert.equal(result.bindings[0].matchStatus, 'review');
+    assert.match(String(result.bindings[0].proposedRel), /^storage\/TV Shows\/Samurai Champloo/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

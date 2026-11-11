@@ -163,6 +163,28 @@ test('builds safe proposals from metadata rather than path input', () => {
     }),
     'shows/Tv Shows/Example (2020)/Season 02/Example - S02E03.mkv',
   );
+  assert.equal(
+    createMetadataProposal({
+      category: 'storage/Movies',
+      type: 'movie',
+      title: 'Example',
+      year: 2020,
+      extension: '.mkv',
+    }),
+    'storage/Movies/Example (2020)/Example (2020).mkv',
+  );
+  assert.equal(
+    createMetadataProposal({
+      category: 'storage/TV Shows',
+      type: 'tv',
+      title: 'Example',
+      year: 2020,
+      season: 2,
+      episode: 3,
+      extension: '.mkv',
+    }),
+    'storage/TV Shows/Example (2020)/Season 02/Example - S02E03.mkv',
+  );
 });
 
 test('rejects unsafe categories, missing episode mappings, and invalid extensions', () => {

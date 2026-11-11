@@ -1,4 +1,11 @@
-import type { ParsedMedia } from './metadata-matching.js';
+import type { MediaType, ParsedMedia } from './metadata-matching.js';
+
+export interface ParsedTitleSuggestions {
+  mediaType?: MediaType;
+  titles: string[];
+  season?: number;
+  episode?: number;
+}
 
 const REQUEST_TIMEOUT_MS = 45_000;
 const MAX_RESPONSE_BYTES = 64 * 1024;
@@ -26,13 +33,14 @@ export class LmStudioClient {
     this.model = model.trim();
   }
 
-  async suggestSearchTitles(rel: string, parsed: ParsedMedia): Promise<string[]> {
+  async suggestSearchTitles(rel: string, parsed: ParsedMedia): Promise<ParsedTitleSuggestions> {
     const prompt = [
-      'Parse the canonical movie or TV series title represented by this media path.',
+      'Parse this media path into its canonical movie or TV series title.',
       'Ignore release groups, edition labels, codec, resolution, language, and file/hash tags.',
-      'Return only a JSON object with a "titles" array containing the canonical title first and up to 2 known alternate title searches.',
-      'Do not return an episode title as the series title, and do not invent a title if uncertain.',
-      `Library type: ${parsed.type}`,
+      'Return only JSON with "mediaType" ("movie" or "tv"), "titles" (canonical title first, up to 2 known alternate title searches), and optional integer "season" and "episode".',
+      'For TV, never infer a season or episode unless it is explicitly present in the path. Do not return an episode title as the series title.',
+      'Do not invent a title or episode mapping if uncertain; omit uncertain values.',
+      `Library type: ${parsed.category === 'storage' ? 'unknown' : parsed.type}`,
       `Existing parsed title: ${parsed.title || '(none)'}`,
       `Existing parsed year: ${parsed.year ?? '(none)'}`,
       `Media path: ${rel.slice(0, 1000)}`,
@@ -102,10 +110,18 @@ export class LmStudioClient {
     if (!isRecord(result) || !Array.isArray(result.titles)) {
       throw new Error('LM Studio title suggestions must contain a titles array.');
     }
-    return [...new Set(result.titles
+    const titles = [...new Set(result.titles
       .filter((title): title is string => typeof title === 'string')
       .map(title => title.trim())
       .filter(title => title.length > 1 && title.length <= 120 && !/[\/\\\0-\x1f]/.test(title)))]
       .slice(0, MAX_TITLE_ALTERNATIVES);
+    const mediaType = result.mediaType === 'movie' || result.mediaType === 'tv' ? result.mediaType : undefined;
+    const season = Number.isInteger(result.season) && Number(result.season) >= 0 && Number(result.season) <= 99
+      ? Number(result.season)
+      : undefined;
+    const episode = Number.isInteger(result.episode) && Number(result.episode) >= 1 && Number(result.episode) <= 999
+      ? Number(result.episode)
+      : undefined;
+    return { mediaType, titles, season, episode };
   }
 }

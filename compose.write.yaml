@@ -9,4 +9,5 @@ services:
     volumes:
       - /srv/data/movies:/media/movies:rw
       - /srv/data/shows:/media/shows:rw
+      - /srv/storage:/media/storage:rw
       - organizer-data:/app/data

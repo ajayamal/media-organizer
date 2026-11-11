@@ -13,17 +13,17 @@ test('requests title suggestions from the configured OpenAI-compatible endpoint'
     requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
     authorization = new Headers(init?.headers).get('authorization') ?? '';
     return new Response(JSON.stringify({
-      choices: [{ message: { content: '{"titles":["Example","Example", "../invalid"]}' } }],
+      choices: [{ message: { content: '{"mediaType":"movie","titles":["Example","Example", "../invalid"],"season":1,"episode":2}' } }],
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
   try {
     const client = new LmStudioClient('http://127.0.0.1:1234/v1/', 'test-model', 'test-token');
     const parsed = parseMediaPath('movies/Movies/Mysterious Film (2020)/movie.mkv', 'movies/Movies');
-    const titles = await client.suggestSearchTitles('movies/Movies/Mysterious Film (2020)/movie.mkv', parsed);
+    const suggestions = await client.suggestSearchTitles('movies/Movies/Mysterious Film (2020)/movie.mkv', parsed);
     assert.equal(requestUrl, 'http://127.0.0.1:1234/v1/chat/completions');
     assert.equal(requestBody?.model, 'test-model');
     assert.equal(authorization, 'Bearer test-token');
-    assert.deepEqual(titles, ['Example']);
+    assert.deepEqual(suggestions, { mediaType: 'movie', titles: ['Example'], season: 1, episode: 2 });
   } finally {
     globalThis.fetch = originalFetch;
   }

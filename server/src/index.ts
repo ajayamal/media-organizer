@@ -20,6 +20,7 @@ const AUTO_APPLY_HIGH_CONFIDENCE = process.env.AUTO_APPLY_HIGH_CONFIDENCE === 't
 const videoExt=new Set(['.mkv','.mp4','.avi','.m4v','.mov','.webm']);
 const subtitleExt=new Set(['.srt','.ass','.ssa','.sub','.idx','.vtt','.smi','.scc']);
 const categories=['movies/Anime','movies/Movies','shows/Anime','shows/Tv Shows'];
+const libraryRoots=[...categories,'storage'];
 const PASSWORD = process.env.ADMIN_PASSWORD || '';
 if (PASSWORD.length < 16) throw new Error('ADMIN_PASSWORD must contain at least 16 characters');
 await fs.mkdir(DATA, {recursive:true});
@@ -98,7 +99,7 @@ const metadataMatcher = new MetadataMatcher(
  lmStudioClient,
  AUTO_APPLY_HIGH_CONFIDENCE && WRITE_ENABLED ? applyMetadataProposal : null,
 );
-const fileAudit = new FileAudit(db, ROOT, categories);
+const fileAudit = new FileAudit(db, ROOT, libraryRoots);
 const tmdbClient = new TmdbClient(db, process.env.TMDB_READ_TOKEN || '');
 app.addHook('onRequest', async (req, reply) => {
   reply.header('X-Content-Type-Options','nosniff');
@@ -147,7 +148,7 @@ app.get('/api/status',async(req,reply)=>({
 app.post('/api/metadata/match',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
  if(!process.env.TMDB_READ_TOKEN?.trim())return reply.code(503).send({error:'Metadata matching is unavailable: TMDB_READ_TOKEN is not configured.'});
  if(AUTO_APPLY_HIGH_CONFIDENCE&&!WRITE_ENABLED)return reply.code(403).send({error:'AUTO_APPLY_HIGH_CONFIDENCE requires ENABLE_WRITES=true and read-write media mounts.'});
- if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return reply.code(409).send({error:'A scan, audit, cleanup, or metadata matching run is already in progress.'});
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy||metadataProposalBusy)return reply.code(409).send({error:'A scan, audit, cleanup, or metadata matching run is already in progress.'});
  const active=db.prepare("SELECT id FROM metadata_match_runs WHERE status IN ('queued','running') LIMIT 1").get() as {id:number}|undefined;
  if(active)return reply.code(409).send({error:'A metadata matching run is already in progress.',runId:active.id});
  const count=(db.prepare('SELECT COUNT(*) AS count FROM inventory').get() as {count:number}).count;
@@ -176,6 +177,45 @@ app.get('/api/metadata/match/:id',{preHandler:requireAuth},async(req:any,reply)=
   FROM metadata_matches WHERE run_id=? AND inventory_id IN (SELECT id FROM inventory) ORDER BY rel LIMIT 2000`).all(id);
  return {run,matches:matches.map((row:any)=>({...row,manualCorrection:Boolean(row.manualCorrection),aiAssisted:Boolean(row.aiAssisted),autoApplied:Boolean(row.autoApplied),explanations:JSON.parse(row.explanations),candidates:JSON.parse(row.candidates)}))};
 });
+app.post('/api/metadata/match/:runId/:inventoryId/apply',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
+ if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; approving a metadata proposal requires explicit write mode.',403);
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy||metadataProposalBusy)return error(reply,'Wait for active filesystem work to finish before approving a metadata proposal.',409);
+ const runId=Number(req.params?.runId);
+ const inventoryId=String(req.params?.inventoryId||'');
+ if(!Number.isSafeInteger(runId)||runId<1||!inventoryId)return error(reply,'Invalid review target.');
+ const runRow=db.prepare('SELECT status FROM metadata_match_runs WHERE id=?').get(runId) as {status:string}|undefined;
+ if(!runRow)return error(reply,'Metadata matching run not found.',404);
+ if(runRow.status!=='completed')return error(reply,'Wait for metadata matching to finish before approving a proposal.',409);
+ const record=db.prepare(`SELECT m.inventory_id AS inventoryId,m.rel,m.proposed_rel AS proposedRel,
+  m.manual_correction AS manualCorrection,i.bytes,i.category
+  FROM metadata_matches m JOIN inventory i ON i.id=m.inventory_id
+  WHERE m.run_id=? AND m.inventory_id=?`).get(runId,inventoryId) as {
+   inventoryId:string,rel:string,proposedRel:string|null,manualCorrection:number,bytes:number,category:string
+  }|undefined;
+ if(!record)return error(reply,'Match or inventory item not found.',404);
+ if(record.category!=='storage')return error(reply,'This approval action is reserved for HDD storage proposals.',400);
+ if(!record.manualCorrection||!record.proposedRel)return error(reply,'Select a TMDB candidate and save the review before approving this HDD proposal.',409);
+ metadataProposalBusy=true;
+ try{
+  const result=await applyMetadataProposal({
+   inventoryId:record.inventoryId,
+   rel:record.rel,
+   proposedRel:record.proposedRel,
+   bytes:record.bytes,
+  },'manual',{runId});
+  if(!result.ok)return error(reply,result.reason||'The metadata proposal could not be applied.',409);
+  const updatedRun=db.prepare('SELECT * FROM metadata_match_runs WHERE id=?').get(runId);
+  const updated=db.prepare(`SELECT inventory_id AS inventoryId,rel,provider_id AS providerId,provider_type AS providerType,
+   title,original_title AS originalTitle,release_year AS releaseYear,episode_title AS episodeTitle,confidence_score AS confidenceScore,
+   confidence,match_status AS matchStatus,explanations,candidates,season,episode,proposed_rel AS proposedRel,error,
+   manual_correction AS manualCorrection,ai_assisted AS aiAssisted,auto_applied AS autoApplied,updated_at AS updatedAt
+   FROM metadata_matches WHERE run_id=? AND inventory_id=?`).get(runId,result.inventoryId) as any;
+  return {run:updatedRun,match:{...updated,manualCorrection:Boolean(updated.manualCorrection),aiAssisted:Boolean(updated.aiAssisted),autoApplied:Boolean(updated.autoApplied),explanations:JSON.parse(updated.explanations),candidates:JSON.parse(updated.candidates)}};
+ }catch(e){
+  req.log.error({err:e,runId,inventoryId},'Failed to apply reviewed HDD metadata proposal');
+  return error(reply,`Metadata proposal failed: ${e instanceof Error?e.message:'Unknown filesystem error.'}`,500);
+ }finally{metadataProposalBusy=false;}
+});
 app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  const runId=Number(req.params?.runId);
  const inventoryId=String(req.params?.inventoryId||'');
@@ -187,7 +227,7 @@ app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,r
   .get(runId,inventoryId) as {candidates:string}|undefined;
  const item=db.prepare('SELECT id,rel,category FROM inventory WHERE id=?').get(inventoryId) as {id:string,rel:string,category:string}|undefined;
  if(!match||!item)return reply.code(404).send({error:'Match or inventory item not found.'});
- const parsed=parseMediaPath(item.rel,item.category);
+ const parsed=parseMediaPath(item.rel,item.category==='storage'?'storage':item.category);
  if(parsed.preservedReason)return reply.code(400).send({error:'Preserved files and specials cannot be proposed for renaming.'});
 
  const body=req.body||{};
@@ -195,13 +235,13 @@ app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,r
  const candidates=JSON.parse(match.candidates) as Array<{id:number,mediaType:'movie'|'tv',title:string,originalTitle:string,year?:number,aliases:string[]}>;
  const candidate=candidates.find(entry=>entry.id===candidateId);
  if(!candidate)return reply.code(400).send({error:'Select a candidate from this match result.'});
- if(candidate.mediaType!==parsed.type)return reply.code(400).send({error:'Candidate type does not match the library category.'});
+ const categoryType=item.category==='storage'?candidate.mediaType:item.category.startsWith('movies/')?'movie':'tv';
+ if(candidate.mediaType!==categoryType)return reply.code(400).send({error:'Candidate type does not match the library category.'});
  if(typeof body.title!=='string'||!body.title.trim()||body.title.length>180)return reply.code(400).send({error:'Enter a title of 1–180 characters.'});
  const title=safeMetadataName(body.title);
  const year=body.year===''||body.year===null||body.year===undefined?candidate.year??null:Number(body.year);
  if(year!==null&&(!Number.isInteger(year)||year<1870||year>new Date().getFullYear()+10))return reply.code(400).send({error:'Enter a valid release year.'});
  let season:number|null=null,episode:number|null=null,episodeTitle:string|null=null;
- const categoryType=item.category.startsWith('movies/')?'movie':'tv';
  if(categoryType==='movie'){
   if(year===null)return reply.code(400).send({error:'A release year is required to propose a movie destination.'});
  }else{
@@ -220,8 +260,12 @@ app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,r
    return reply.code(502).send({error:error instanceof Error?`Could not verify episode mapping: ${error.message}`:'Could not verify episode mapping.'});
   }
  }
- const proposal=createMetadataProposal({category:item.category,type:categoryType,title,year,season,episode,extension:path.posix.extname(item.rel)});
+ const proposalCategory=item.category==='storage'
+  ? categoryType==='movie'?'storage/Movies':'storage/TV Shows'
+  : item.category;
+ const proposal=createMetadataProposal({category:proposalCategory,type:categoryType,title,year,season,episode,extension:path.posix.extname(item.rel)});
  if(!proposal)return reply.code(400).send({error:'Unable to create a safe destination from the supplied correction.'});
+ const proposedRel=proposal===item.rel?null:proposal;
  const now=new Date().toISOString();
  const explanations=[
   'Provider candidate and title were manually selected by the user.',
@@ -239,9 +283,9 @@ app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,r
     originalTitle:candidate.originalTitle,providerYear:candidate.year??null,title,year,aliases:JSON.stringify(candidate.aliases),
     candidateSet:JSON.stringify(candidates),season,episode,now});
   db.prepare(`UPDATE metadata_matches SET provider_id=?,provider_type=?,title=?,original_title=?,release_year=?,episode_title=?,
-   confidence_score=100,confidence='high',match_status='matched',explanations=?,season=?,episode=?,proposed_rel=?,error=NULL,
+   confidence_score=100,confidence='high',match_status=?,explanations=?,season=?,episode=?,proposed_rel=?,error=NULL,
    manual_correction=1,updated_at=? WHERE run_id=? AND inventory_id=?`)
-   .run(candidate.id,candidate.mediaType,title,candidate.originalTitle,year,episodeTitle,JSON.stringify(explanations),season,episode,proposal,now,runId,inventoryId);
+   .run(candidate.id,candidate.mediaType,title,candidate.originalTitle,year,episodeTitle,item.category==='storage'?'review':'matched',JSON.stringify(explanations),season,episode,proposedRel,now,runId,inventoryId);
   const counts=db.prepare(`SELECT
    SUM(CASE WHEN match_status='matched' THEN 1 ELSE 0 END) AS matched,
    SUM(CASE WHEN match_status='review' THEN 1 ELSE 0 END) AS review,
@@ -302,12 +346,13 @@ function suggest(rel:string):{proposal:string|null,issue:string,confidence:strin
  const dest=[...parts.slice(0,2),movie,`${movie}${ext}`].join('/');
  return {proposal:dest===rel?null:dest,issue:dest===rel?'Already standardized':'Movie release naming',confidence:'high'};
 }
-async function walk(dir:string,emit:(file:string,bytes:number)=>void){
+async function walk(dir:string,emit:(file:string,bytes:number)=>void,ignoreHidden=false){
  const entries=await fs.readdir(dir,{withFileTypes:true});
  for(const entry of entries){
+  if(ignoreHidden&&entry.name.startsWith('.'))continue;
   if(entry.isSymbolicLink())continue;
   const full=path.join(dir,entry.name);
-  if(entry.isDirectory()) await walk(full,emit);
+  if(entry.isDirectory()) await walk(full,emit,ignoreHidden);
   else if(entry.isFile() && videoExt.has(path.extname(entry.name).toLowerCase())){
    const stat=await fs.stat(full);emit(full,stat.size);
   }
@@ -315,7 +360,9 @@ async function walk(dir:string,emit:(file:string,bytes:number)=>void){
 }
 function validRel(rel:string){
  if(typeof rel!=='string'||!rel||rel.includes('\\')||rel.includes('\0')||path.posix.isAbsolute(rel))return false;
- const parts=rel.split('/');return parts.every(p=>p!==''&&p!=='.'&&p!=='..') && categories.some(c=>rel.startsWith(c+'/'));
+ const parts=rel.split('/');
+ return parts.every(p=>p!==''&&p!=='.'&&p!=='..')
+  && (categories.some(c=>rel.startsWith(c+'/'))||rel.startsWith('storage/'));
 }
 async function verifiedPath(rel:string){
  if(!validRel(rel))throw new Error('Invalid media path');
@@ -340,22 +387,34 @@ async function moveWithoutOverwrite(src:string,dst:string){
   throw error;
  }
 }
-async function applyMetadataProposal(record:{inventoryId:string,rel:string,proposedRel:string,bytes:number}):Promise<{ok:boolean,inventoryId?:string,rel?:string,reason?:string}>{
- if(!WRITE_ENABLED||!AUTO_APPLY_HIGH_CONFIDENCE)return {ok:false,reason:'Automatic matching writes are disabled.'};
+async function applyMetadataProposal(
+ record:{inventoryId:string,rel:string,proposedRel:string,bytes:number},
+ mode:'automatic'|'manual'='automatic',
+ review?:{runId:number},
+):Promise<{ok:boolean,inventoryId?:string,rel?:string,reason?:string}>{
+ if(!WRITE_ENABLED||(mode==='automatic'&&!AUTO_APPLY_HIGH_CONFIDENCE))return {ok:false,reason:'Metadata matching writes are disabled.'};
  const item=db.prepare('SELECT * FROM inventory WHERE id=?').get(record.inventoryId) as any;
  if(!item||item.rel!==record.rel||item.bytes!==record.bytes)return {ok:false,reason:'The inventory entry changed; scan and match again.'};
- if(!record.proposedRel.startsWith(`${item.category}/`)
+ if(item.category==='storage'&&mode==='automatic')return {ok:false,reason:'HDD files require explicit approval.'};
+ const allowedDestination=item.category==='storage'
+  ? record.proposedRel.startsWith('storage/Movies/')||record.proposedRel.startsWith('storage/TV Shows/')
+  : record.proposedRel.startsWith(`${item.category}/`);
+ if(!allowedDestination
   ||path.posix.extname(record.proposedRel).toLowerCase()!==path.posix.extname(record.rel).toLowerCase()){
   return {ok:false,reason:'The proposed destination does not preserve the media category and file type.'};
  }
  if(record.proposedRel===record.rel)return {ok:false,reason:'The file is already at the proposed path.'};
+ const match=review
+  ? db.prepare('SELECT explanations FROM metadata_matches WHERE run_id=? AND inventory_id=? AND proposed_rel=?').get(review.runId,record.inventoryId,record.proposedRel) as {explanations:string}|undefined
+  : undefined;
+ if(review&&!match)return {ok:false,reason:'The review proposal is stale; match the library again.'};
  const src=await verifiedPath(record.rel),dst=await verifiedPath(record.proposedRel);
  const stat=await fs.lstat(src);
  if(!stat.isFile()||stat.isSymbolicLink())return {ok:false,reason:'Source is not a regular file.'};
  if(stat.size!==record.bytes)return {ok:false,reason:'Source changed since scanning; scan again.'};
  const siblings=await fs.readdir(path.dirname(src),{withFileTypes:true});
  if(siblings.some(entry=>(entry.isFile()||entry.isSymbolicLink())&&subtitleExt.has(path.extname(entry.name).toLowerCase()))){
-  return {ok:false,reason:'A sidecar subtitle is present; automatic rename is blocked to keep it aligned with the video.'};
+  return {ok:false,reason:'A sidecar subtitle is present; renaming is blocked to keep it aligned with the video.'};
  }
  try{await fs.lstat(dst);return {ok:false,reason:'Destination already exists.'};}
  catch(error:any){if(error.code!=='ENOENT')throw error;}
@@ -366,12 +425,34 @@ async function applyMetadataProposal(record:{inventoryId:string,rel:string,propo
  const newId=sha(record.proposedRel);
  try{
   db.transaction(()=>{
+   const issue=mode==='automatic'?'Automatically renamed by metadata matching':'Renamed after metadata review';
    const update=db.prepare(`UPDATE inventory SET id=?,rel=?,issue=?,proposal=NULL,confidence='high',scanned_at=?
-    WHERE id=? AND rel=? AND bytes=?`).run(newId,record.proposedRel,'Automatically renamed by metadata matching',new Date().toISOString(),
+    WHERE id=? AND rel=? AND bytes=?`).run(newId,record.proposedRel,issue,new Date().toISOString(),
      record.inventoryId,record.rel,record.bytes);
    if(update.changes!==1)throw new Error('Inventory entry changed before the automatic rename could be recorded.');
    db.prepare(`INSERT INTO operations (old_rel,new_rel,status,created_at,inventory_retained)
     VALUES (?,?,'applied',?,1)`).run(record.rel,record.proposedRel,new Date().toISOString());
+   if(review&&match){
+    let explanations:unknown;
+    try{explanations=JSON.parse(match.explanations);}catch{throw new Error('Saved metadata review explanations are invalid.');}
+    if(!Array.isArray(explanations)||!explanations.every(entry=>typeof entry==='string'))throw new Error('Saved metadata review explanations are invalid.');
+    explanations.push('Renamed after explicit user approval.');
+    const updated=db.prepare(`UPDATE metadata_matches SET inventory_id=?,rel=?,proposed_rel=NULL,match_status='matched',
+     explanations=?,updated_at=? WHERE run_id=? AND inventory_id=? AND proposed_rel=?`)
+     .run(newId,record.proposedRel,JSON.stringify(explanations),new Date().toISOString(),review.runId,record.inventoryId,record.proposedRel);
+    if(updated.changes!==1)throw new Error('Metadata review changed before the approved rename could be recorded.');
+    const correction=db.prepare("UPDATE metadata_corrections SET rel=?,updated_at=? WHERE rel=? AND category='storage'")
+     .run(record.proposedRel,new Date().toISOString(),record.rel);
+    if(correction.changes!==1)throw new Error('The saved HDD metadata correction could not be moved to the new path.');
+    const counts=db.prepare(`SELECT
+     SUM(CASE WHEN match_status='matched' THEN 1 ELSE 0 END) AS matched,
+     SUM(CASE WHEN match_status='review' THEN 1 ELSE 0 END) AS review,
+     SUM(CASE WHEN match_status='unmatched' THEN 1 ELSE 0 END) AS unmatched,
+     SUM(CASE WHEN match_status='preserved' THEN 1 ELSE 0 END) AS preserved
+     FROM metadata_matches WHERE run_id=?`).get(review.runId) as {matched:number,review:number,unmatched:number,preserved:number};
+    db.prepare('UPDATE metadata_match_runs SET matched=?,review=?,unmatched=?,preserved=? WHERE id=?')
+     .run(counts.matched||0,counts.review||0,counts.unmatched||0,counts.preserved||0,review.runId);
+   }
   })();
  }catch(error){
   try{
@@ -391,6 +472,7 @@ let auditing=false;
 let quarantining=false;
 let metadataMatching=false;
 let emptyFolderBusy=false;
+let metadataProposalBusy=false;
 function updateAuditDuplicateSummary(runId:number){
  const summary=db.prepare(`SELECT COUNT(*) AS groups,COALESCE(SUM(file_count),0) AS files FROM (
   SELECT COUNT(*) AS file_count FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL AND quarantined=0
@@ -401,7 +483,7 @@ function updateAuditDuplicateSummary(runId:number){
 }
 app.post('/api/audit/:id/quarantine',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; duplicate cleanup requires explicit write mode.',403);
- if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy||metadataProposalBusy)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
  const runId=Number(req.params?.id);
  if(!Number.isSafeInteger(runId)||runId<1)return error(reply,'Invalid file audit run id.');
  const run=db.prepare('SELECT status FROM file_audit_runs WHERE id=?').get(runId) as {status:string}|undefined;
@@ -488,7 +570,7 @@ app.post('/api/audit/:id/quarantine',{preHandler:[requireOrigin,requireAuth]},as
 });
 app.post('/api/quarantine/:id/restore',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; restoring quarantined files requires explicit write mode.',403);
- if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy||metadataProposalBusy)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
  const id=Number(req.params?.id);
  if(!Number.isSafeInteger(id)||id<1)return error(reply,'Invalid quarantine record id.');
  const item=db.prepare('SELECT * FROM file_quarantine WHERE id=?').get(id) as any;
@@ -521,7 +603,7 @@ app.post('/api/quarantine/:id/restore',{preHandler:[requireOrigin,requireAuth]},
  }finally{quarantining=false;}
 });
 app.post('/api/audit',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
- if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy||metadataProposalBusy)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
  const startedAt=new Date().toISOString();
  const info=db.prepare("INSERT INTO file_audit_runs (status,started_at) VALUES ('queued',?)").run(startedAt);
  const runId=Number(info.lastInsertRowid);
@@ -568,10 +650,10 @@ app.get('/api/quarantine',{preHandler:requireAuth},async()=>({
   ORDER BY id DESC`).all(),
 }));
 app.post('/api/empty-folders/scan',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
-  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return error(reply,'A scan, audit, cleanup, or metadata matching run is already running.',409);
+  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy||metadataProposalBusy)return error(reply,'A scan, audit, cleanup, or metadata matching run is already running.',409);
   emptyFolderBusy=true;
   try{
-   return {folders:await findEmptyFolders(ROOT,categories)};
+   return {folders:await findEmptyFolders(ROOT,libraryRoots)};
   }catch(e){
    req.log.error({err:e},'Failed to scan for empty media folders');
    return error(reply,`Empty-folder scan failed: ${e instanceof Error?e.message:'Unknown filesystem error.'}`,500);
@@ -579,14 +661,14 @@ app.post('/api/empty-folders/scan',{preHandler:[requireOrigin,requireAuth]},asyn
 });
 app.post('/api/empty-folders/remove',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
   if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; removing empty folders requires explicit write mode.',403);
-  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return error(reply,'A scan, audit, cleanup, or metadata matching run is already running.',409);
+  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy||metadataProposalBusy)return error(reply,'A scan, audit, cleanup, or metadata matching run is already running.',409);
   const folders=req.body?.folders;
   if(!Array.isArray(folders)||folders.length===0||folders.length>1000||!folders.every((folder:unknown)=>typeof folder==='string')){
    return error(reply,'Select between 1 and 1,000 scanned empty folder trees to remove.');
   }
   emptyFolderBusy=true;
   try{
-   return await removeEmptyFolders(ROOT,categories,folders);
+   return await removeEmptyFolders(ROOT,libraryRoots,folders);
   }catch(e){
    const message=e instanceof Error?e.message:'Unknown filesystem error.';
    if(message.startsWith('Folder is no longer empty or is outside the library:'))return error(reply,message,409);
@@ -596,17 +678,20 @@ app.post('/api/empty-folders/remove',{preHandler:[requireOrigin,requireAuth]},as
   }finally{emptyFolderBusy=false;}
 });
 app.post('/api/scan',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
-  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
+  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy||metadataProposalBusy)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
  scanning=true;
  try{
   const rows:Array<{id:string,rel:string,bytes:number,category:string,issue:string,proposal:string|null,confidence:string,scanned_at:string}>=[];
   const now=new Date().toISOString();
-  for(const cat of categories){
+  for(const cat of libraryRoots){
    const dir=path.join(ROOT,cat);
-   try{await walk(dir,(full,bytes)=>{
-    const rel=path.relative(ROOT,full).split(path.sep).join('/');const s=suggest(rel);
-    rows.push({id:sha(rel),rel,bytes,category:cat,issue:s.issue,proposal:s.proposal,confidence:s.confidence,scanned_at:now});
-   });}catch(e:any){if(e.code!=='ENOENT')throw e;}
+   try{await walk(dir,(full,bytes)=> {
+    const rel=path.relative(ROOT,full).split(path.sep).join('/');
+    const s=cat==='storage'
+     ? {proposal:null,issue:'HDD item requires metadata review',confidence:'review'}
+     : suggest(rel);
+     rows.push({id:sha(rel),rel,bytes,category:cat==='storage'?'storage':cat,issue:s.issue,proposal:s.proposal,confidence:s.confidence,scanned_at:now});
+   },cat==='storage');}catch(e:any){if(e.code!=='ENOENT')throw e;}
   }
   const save=db.transaction(()=>{
    db.prepare('DELETE FROM inventory').run();
@@ -626,7 +711,7 @@ app.get('/api/operations',{preHandler:requireAuth},async()=>({items:db.prepare('
 function error(reply:any,msg:string,status=400){return reply.code(status).send({error:msg});}
 app.post('/api/apply',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled',403);
- if(metadataMatching||emptyFolderBusy)return error(reply,'Wait for the active filesystem operation to finish before applying a rename.',409);
+ if(metadataMatching||emptyFolderBusy||metadataProposalBusy)return error(reply,'Wait for the active filesystem operation to finish before applying a rename.',409);
  const {id,expectedProposal}=req.body||{};
  if(typeof id!=='string'||typeof expectedProposal!=='string')return error(reply,'Invalid request');
  const item=db.prepare('SELECT * FROM inventory WHERE id=?').get(id) as any;
@@ -647,7 +732,7 @@ app.post('/api/apply',{preHandler:[requireOrigin,requireAuth]},async(req:any,rep
 });
 app.post('/api/undo',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled',403);
- if(metadataMatching||emptyFolderBusy)return error(reply,'Wait for the active filesystem operation to finish before undoing a rename.',409);
+ if(metadataMatching||emptyFolderBusy||metadataProposalBusy)return error(reply,'Wait for the active filesystem operation to finish before undoing a rename.',409);
  const id=req.body?.id;
  if(!Number.isSafeInteger(id))return error(reply,'Invalid operation id');
  const op=db.prepare('SELECT * FROM operations WHERE id=?').get(id) as any;
@@ -661,11 +746,31 @@ app.post('/api/undo',{preHandler:[requireOrigin,requireAuth]},async(req:any,repl
   try{
    db.transaction(()=>{
     if(op.inventory_retained){
-     const suggestion=suggest(op.old_rel);
+     const suggestion=op.old_rel.startsWith('storage/')
+      ? {proposal:null,issue:'HDD item requires metadata review',confidence:'review'}
+      : suggest(op.old_rel);
      const restored=db.prepare(`UPDATE inventory SET id=?,rel=?,issue=?,proposal=?,confidence=?,scanned_at=?
       WHERE id=? AND rel=?`).run(sha(op.old_rel),op.old_rel,suggestion.issue,suggestion.proposal,suggestion.confidence,
        new Date().toISOString(),sha(op.new_rel),op.new_rel);
      if(restored.changes!==1)throw new Error('The retained inventory entry is missing; rescan is required before this operation can be recorded as undone.');
+     const matchingRuns=db.prepare('SELECT DISTINCT run_id AS runId FROM metadata_matches WHERE inventory_id=? AND rel=?')
+      .all(sha(op.new_rel),op.new_rel) as Array<{runId:number}>;
+     db.prepare(`UPDATE metadata_matches SET inventory_id=?,rel=?,proposed_rel=?,match_status=CASE
+      WHEN manual_correction=1 THEN 'review' ELSE match_status END,auto_applied=0,updated_at=?
+      WHERE inventory_id=? AND rel=?`)
+      .run(sha(op.old_rel),op.old_rel,op.new_rel,new Date().toISOString(),sha(op.new_rel),op.new_rel);
+     db.prepare("UPDATE metadata_corrections SET rel=?,updated_at=? WHERE rel=? AND category='storage'")
+      .run(op.old_rel,new Date().toISOString(),op.new_rel);
+     for(const matchingRun of matchingRuns){
+      const counts=db.prepare(`SELECT
+       SUM(CASE WHEN match_status='matched' THEN 1 ELSE 0 END) AS matched,
+       SUM(CASE WHEN match_status='review' THEN 1 ELSE 0 END) AS review,
+       SUM(CASE WHEN match_status='unmatched' THEN 1 ELSE 0 END) AS unmatched,
+       SUM(CASE WHEN match_status='preserved' THEN 1 ELSE 0 END) AS preserved
+       FROM metadata_matches WHERE run_id=?`).get(matchingRun.runId) as {matched:number,review:number,unmatched:number,preserved:number};
+      db.prepare('UPDATE metadata_match_runs SET matched=?,review=?,unmatched=?,preserved=? WHERE id=?')
+       .run(counts.matched||0,counts.review||0,counts.unmatched||0,counts.preserved||0,matchingRun.runId);
+     }
     }
     db.prepare('UPDATE operations SET status=?,undone_at=? WHERE id=?').run('undone',new Date().toISOString(),id);
    })();

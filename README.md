@@ -21,7 +21,7 @@ A self-hosted React + TypeScript dashboard, Fastify API, SQLite inventory and re
 
 ## Requirements
 
-Ubuntu Server with Docker Engine and Compose plugin. Existing media at `/srv/data/movies` and `/srv/data/shows`. The app runs as UID 1000 (the default `node` user in the official Node image). On your server, UID 1000 corresponds to `sillygooze`. The named SQLite volume must be writable by UID 1000; Docker usually initializes its ownership from the image's `/app/data` directory.
+Ubuntu Server with Docker Engine and Compose plugin. Existing media at `/srv/data/movies` and `/srv/data/shows`; the unorganized HDD is mounted from `/srv/storage`. The app runs as UID 1000 (the default `node` user in the official Node image). On your server, UID 1000 corresponds to `sillygooze`. The named SQLite volume must be writable by UID 1000; Docker usually initializes its ownership from the image's `/app/data` directory.
 
 ## Build and launch (SSH on Ubuntu)
 
@@ -89,7 +89,7 @@ cd /srv/apps/media-organizer
 docker compose -f compose.yaml -f compose.write.yaml up -d
 ```
 
-This overrides the media mounts to `:rw` and sets `ENABLE_WRITES=true`. Confirm `docker inspect media-organizer` shows the expected mounts. Approve only individual high-confidence proposals and individually confirmed duplicate quarantine actions in the UI. The backend rechecks file identity and destination existence before each action. Quarantined copies are stored under `/media/.media-organizer-quarantine` and can be restored from the File audit page.
+This overrides the media mounts to `:rw` and sets `ENABLE_WRITES=true`. Confirm `docker inspect media-organizer` shows the expected mounts. Approve only individual high-confidence proposals and individually confirmed duplicate quarantine actions in the UI. HDD files are scanned and audited under the distinct `storage/` path, but their AI/TMDB rename suggestions always require a saved manual review and an explicit approval; they are never auto-applied. HDD scans and audits can take longer. The backend rechecks file identity and destination existence before each action. Quarantined copies are stored under `/media/.media-organizer-quarantine` and can be restored from the File audit page.
 
 Return to read-only mode:
 

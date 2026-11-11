@@ -10,7 +10,7 @@ import {
   type ParsedMedia,
 } from './metadata-matching.js';
 import { TmdbClient, TmdbError, type TmdbCandidate, type TmdbEpisode } from './tmdb.js';
-import { LmStudioClient } from './lm-studio.js';
+import { LmStudioClient, type ParsedTitleSuggestions } from './lm-studio.js';
 
 interface InventoryRow {
   id: string;
@@ -72,7 +72,7 @@ export class MetadataMatcher {
     this.db.prepare("UPDATE metadata_match_runs SET status='running',total=? WHERE id=?").run(rows.length, runId);
 
     const titleSearchCache = new Map<string, Promise<TmdbCandidate[]>>();
-    const aiTitleCache = new Map<string, Promise<string[]>>();
+    const aiTitleCache = new Map<string, Promise<ParsedTitleSuggestions>>();
     let matched = 0;
     let review = 0;
     let unmatched = 0;
@@ -97,6 +97,7 @@ export class MetadataMatcher {
       }
 
       if (this.autoApply
+        && row.category !== 'storage'
         && result.matchStatus === 'matched'
         && result.confidence === 'high'
         && !result.aiAssisted
@@ -147,17 +148,64 @@ export class MetadataMatcher {
   private async matchRow(
     row: InventoryRow,
     searchCache: Map<string, Promise<TmdbCandidate[]>>,
-    aiTitleCache: Map<string, Promise<string[]>>,
+    aiTitleCache: Map<string, Promise<ParsedTitleSuggestions>>,
   ) {
-    const parsed = parseMediaPath(row.rel, row.category);
+    const isStorage = row.category === 'storage';
+    let parsed = parseMediaPath(row.rel, isStorage ? 'storage' : row.category);
     if (parsed.preservedReason) {
       return this.makeRecord(row, parsed, { score: 0, confidence: 'preserved', candidates: [], explanations: [parsed.preservedReason] });
     }
     const correction = this.db.prepare('SELECT * FROM metadata_corrections WHERE rel=? AND category=?')
       .get(row.rel, row.category) as MetadataCorrection | undefined;
     if (correction) return this.applyCorrection(row, parsed, correction);
+    if (isStorage && !this.aiClient) {
+      return this.makeRecord(row, parsed, {
+        score: 0,
+        confidence: 'unmatched',
+        candidates: [],
+        explanations: ['Unorganized HDD files require LM Studio to suggest a media type and title before TMDB matching.'],
+      });
+    }
     if (!parsed.title && !this.aiClient) {
       return this.makeRecord(row, parsed, { score: 0, confidence: 'unmatched', candidates: [], explanations: ['No reliable title could be extracted.'] });
+    }
+
+    let aiParse: ParsedTitleSuggestions | undefined;
+    let aiError: string | undefined;
+    if (this.aiClient) {
+      const directory = row.rel.slice(0, row.rel.lastIndexOf('/'));
+      const key = `${row.category}:${directory}:${normalizeTitle(parsed.title)}:${parsed.year ?? ''}`;
+      let suggestions = aiTitleCache.get(key);
+      if (!suggestions) {
+        suggestions = this.aiClient.suggestSearchTitles(row.rel, parsed);
+        aiTitleCache.set(key, suggestions);
+      }
+      try {
+        aiParse = await suggestions;
+      } catch (error) {
+        aiError = error instanceof Error ? error.message : 'Unknown LM Studio error.';
+      }
+    }
+    if (isStorage) {
+      if (!aiParse?.mediaType || aiParse.titles.length === 0) {
+        return this.makeRecord(row, parsed, {
+          score: 0,
+          confidence: 'unmatched',
+          candidates: [],
+          explanations: [`LM Studio could not confidently parse a media type and title${aiError ? `: ${aiError}` : '.'}`],
+        });
+      }
+      const category = aiParse.mediaType === 'movie' ? 'storage/Movies' : 'storage/TV Shows';
+      parsed = {
+        ...parsed,
+        category,
+        type: aiParse.mediaType,
+        title: aiParse.titles[0],
+        season: aiParse.mediaType === 'tv' ? parsed.season : undefined,
+        episode: aiParse.mediaType === 'tv' ? parsed.episode : undefined,
+        episodeStyle: aiParse.mediaType === 'tv' ? parsed.episodeStyle : undefined,
+        folderSeason: aiParse.mediaType === 'tv' ? parsed.folderSeason : undefined,
+      };
     }
 
     const searchTitles = async (title: string): Promise<TmdbCandidate[]> => {
@@ -173,28 +221,13 @@ export class MetadataMatcher {
     if (parsed.title) {
       for (const candidate of await searchTitles(parsed.title)) foundById.set(candidate.id, candidate);
     }
-    let assistedTitles: string[] = [];
-    let aiError: string | undefined;
-    if (this.aiClient) {
-      const directory = row.rel.slice(0, row.rel.lastIndexOf('/'));
-      const key = `${parsed.type}:${directory}:${normalizeTitle(parsed.title)}:${parsed.year ?? ''}`;
-      let suggestions = aiTitleCache.get(key);
-      if (!suggestions) {
-        suggestions = this.aiClient.suggestSearchTitles(row.rel, parsed);
-        aiTitleCache.set(key, suggestions);
-      }
+    const assistedTitles = aiParse?.titles ?? [];
+    for (const title of assistedTitles) {
+      if (normalizeTitle(title) === normalizeTitle(parsed.title)) continue;
       try {
-        assistedTitles = await suggestions;
+        for (const candidate of await searchTitles(title)) foundById.set(candidate.id, candidate);
       } catch (error) {
-        aiError = error instanceof Error ? error.message : 'Unknown LM Studio error.';
-      }
-      for (const title of assistedTitles) {
-        if (normalizeTitle(title) === normalizeTitle(parsed.title)) continue;
-        try {
-          for (const candidate of await searchTitles(title)) foundById.set(candidate.id, candidate);
-        } catch (error) {
-          aiError = error instanceof Error ? error.message : 'TMDB search for an AI-suggested title failed.';
-        }
+        aiError = error instanceof Error ? error.message : 'TMDB search for an AI-suggested title failed.';
       }
     }
 
@@ -235,12 +268,23 @@ export class MetadataMatcher {
 
     const mapping = await this.episodeMapping(parsed, scored.candidate);
     const record = this.makeRecord(row, parsed, scored, mapping.proposal, undefined, mapping.episodeTitle);
+    if (isStorage) {
+      record.aiAssisted = true;
+      if (record.confidence === 'high') {
+        record.confidence = 'medium';
+        record.confidenceScore = Math.min(record.confidenceScore, 89);
+      }
+      record.matchStatus = 'review';
+      record.explanations.push('HDD classification came from LM Studio; verify this candidate before organizing.');
+    }
     if (mapping.blockReason) {
       record.explanations.push(mapping.blockReason);
       record.confidence = record.confidence === 'high' ? 'medium' : record.confidence;
       record.confidenceScore = Math.min(record.confidenceScore, 89);
       record.matchStatus = 'review';
       record.proposedRel = null;
+    } else if (isStorage) {
+      record.matchStatus = 'review';
     } else if (record.confidence === 'high' && !parsed.episodeStyle?.includes('absolute')) {
       record.matchStatus = 'matched';
     } else {
@@ -358,6 +402,10 @@ export class MetadataMatcher {
     }
     const correctedParsed: ParsedMedia = {
       ...parsed,
+      type: correction.provider_type,
+      category: correction.category === 'storage'
+        ? correction.provider_type === 'movie' ? 'storage/Movies' : 'storage/TV Shows'
+        : correction.category,
       title: correction.corrected_title,
       year: correction.corrected_year ?? undefined,
       season: correction.season ?? undefined,
@@ -386,6 +434,8 @@ export class MetadataMatcher {
       record.matchStatus = 'review';
       record.proposedRel = null;
       record.explanations.push(mapping.blockReason);
+    } else if (correction.category === 'storage') {
+      record.matchStatus = 'review';
     } else {
       record.matchStatus = 'matched';
     }
@@ -427,7 +477,7 @@ export class MetadataMatcher {
       candidates: scored.candidates,
       season: parsed.season ?? null,
       episode: parsed.episode ?? null,
-      proposedRel: proposedRel ?? null,
+      proposedRel: proposedRel && proposedRel !== row.rel ? proposedRel : null,
       error: error ?? null,
       manualCorrection: false,
       updatedAt: new Date().toISOString(),

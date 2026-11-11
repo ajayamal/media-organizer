@@ -61,3 +61,16 @@ test('rechecks candidate emptiness and rejects stale paths before removal', asyn
   );
   assert.deepEqual(await readdir(folder), ['keep.txt']);
 });
+
+test('finds and removes empty folders under the storage root', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'media-organizer-storage-empty-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const emptyFolder = path.join(root, 'storage/Unsorted/Empty Movie');
+  await mkdir(emptyFolder, { recursive: true });
+
+  const folders = await findEmptyFolders(root, ['storage']);
+  assert.deepEqual(folders, ['storage/Unsorted', 'storage/Unsorted/Empty Movie']);
+  const result = await removeEmptyFolders(root, ['storage'], folders);
+  assert.deepEqual(result.removed, ['storage/Unsorted/Empty Movie', 'storage/Unsorted']);
+  assert.deepEqual(result.failures, []);
+});

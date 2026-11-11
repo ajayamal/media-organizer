@@ -179,6 +179,7 @@ function App() {
   const [tab, setTab] = useState<Tab>('library');
   const [busy, setBusy] = useState(false);
   const [matchingBusy, setMatchingBusy] = useState(false);
+  const [metadataApplying, setMetadataApplying] = useState(false);
   const [msg, setMsg] = useState('');
   const [matchError, setMatchError] = useState('');
   const [filter, setFilter] = useState('all');
@@ -483,6 +484,32 @@ function App() {
     setMatches(current => current.map(item => item.inventoryId === result.match.inventoryId ? result.match : item));
   };
 
+  const approveStorageProposal = async (match: MetadataMatch) => {
+    if (!matchRun || !match.proposedRel || !match.manualCorrection) return;
+    if (!writes) {
+      setMatchError('Enable write mode and read-write media mounts before approving an HDD proposal.');
+      return;
+    }
+    if (!window.confirm(`Approve this HDD rename?\n\nFROM: ${match.rel}\n\nTO: ${match.proposedRel}\n\nThis action is journaled and can be undone.`)) return;
+    setMetadataApplying(true);
+    setMatchError('');
+    try {
+      const result = await api<{ run: MatchRun; match: MetadataMatch }>(
+        `/metadata/match/${matchRun.id}/${encodeURIComponent(match.inventoryId)}/apply`,
+        'POST',
+        {},
+      );
+      setMatchRun(result.run);
+      setMatches(current => current.map(item => item.inventoryId === match.inventoryId ? result.match : item));
+      await load();
+      setMsg(`Approved and renamed ${match.rel}.`);
+    } catch (error) {
+      setMatchError(error instanceof Error ? error.message : 'Unable to apply the reviewed HDD proposal.');
+    } finally {
+      setMetadataApplying(false);
+    }
+  };
+
   const apply = (item: Item) => {
     if (!item.proposal || !window.confirm(`Rename this file?\n\nFROM: ${item.rel}\n\nTO: ${item.proposal}\n\nNo files will be deleted.`)) return;
     void run(() => api('/apply', 'POST', { id: item.id, expectedProposal: item.proposal }));
@@ -666,6 +693,9 @@ function App() {
             onStart={startMatching}
             onFilter={setMatchFilter}
             onSaveCorrection={saveCorrection}
+            onApproveStorageProposal={approveStorageProposal}
+            writes={writes}
+            metadataApplying={metadataApplying}
           />
         )}
 
@@ -1002,6 +1032,9 @@ function MetadataPanel({
   onStart,
   onFilter,
   onSaveCorrection,
+  onApproveStorageProposal,
+  writes,
+  metadataApplying,
 }: {
   itemsCount: number;
   aiMatchingEnabled: boolean;
@@ -1021,6 +1054,9 @@ function MetadataPanel({
     match: MetadataMatch,
     correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
   ) => Promise<void>;
+  onApproveStorageProposal: (match: MetadataMatch) => Promise<void>;
+  writes: boolean;
+  metadataApplying: boolean;
 }) {
   return (
     <>
@@ -1029,10 +1065,10 @@ function MetadataPanel({
         <div className="metadata-intro-copy">
           <h2>Match your library with TMDB</h2>
           <p>TMDB supplies metadata and verifies standard episode numbers. {aiMatchingEnabled
-            ? 'Local LM Studio parses title searches for each media folder; TMDB validates the candidates, and AI-assisted results remain in review.'
+            ? 'Local LM Studio parses titles; TMDB validates candidates, and AI-assisted results remain in review.'
             : 'Configure LM Studio to parse title searches before TMDB matching.'} {autoApplyHighConfidenceEnabled
               ? 'Deterministic high-confidence matches will be renamed automatically; AI-assisted matches remain in review and manually corrected matches are never auto-renamed.'
-              : 'Matching does not rename files unless high-confidence auto-apply is explicitly enabled in the server configuration.'}</p>
+                : 'Matching does not rename files unless high-confidence auto-apply is explicitly enabled in the server configuration.'} HDD items always require manual review and explicit approval.</p>
         </div>
         <button className="primary" disabled={matchingActive || matchingBusy || itemsCount === 0} onClick={onStart}>
           <Sparkles size={16} />{matchingBusy ? 'Starting...' : matchingActive ? 'Matching...' : matchRun ? 'Run matching again' : 'Start matching'}
@@ -1081,8 +1117,16 @@ function MetadataPanel({
             </div>
             {matches.length === 0
               ? <div className="empty">{matchingActive ? 'Waiting for matching results...' : 'No results for this filter.'}</div>
-              : <div className="match-groups">{groups.map(group => <MetadataGroupCard key={group.key} group={group} runId={runId} onSaveCorrection={onSaveCorrection} />)}</div>}
-            <footer>{matches.length} result(s) shown · {autoApplyHighConfidenceEnabled ? 'Automatic renames are journaled and undoable.' : 'No files changed by matching.'}</footer>
+              : <div className="match-groups">{groups.map(group => <MetadataGroupCard
+                key={group.key}
+                group={group}
+                runId={runId}
+                onSaveCorrection={onSaveCorrection}
+                onApproveStorageProposal={onApproveStorageProposal}
+                writes={writes}
+                metadataApplying={metadataApplying}
+              />)}</div>}
+            <footer>{matches.length} result(s) shown · HDD proposals always require explicit approval.</footer>
           </section>
         </>
       )}
@@ -1094,6 +1138,9 @@ function MetadataGroupCard({
   group,
   runId,
   onSaveCorrection,
+  onApproveStorageProposal,
+  writes,
+  metadataApplying,
 }: {
   group: MetadataGroup;
   runId: number | null;
@@ -1101,6 +1148,9 @@ function MetadataGroupCard({
     match: MetadataMatch,
     correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
   ) => Promise<void>;
+  onApproveStorageProposal: (match: MetadataMatch) => Promise<void>;
+  writes: boolean;
+  metadataApplying: boolean;
 }) {
   const average = Math.round(group.matches.reduce((total, match) => total + match.confidenceScore, 0) / group.matches.length);
   const matchedEpisodes = group.matches.filter(match => match.providerType === 'tv' && match.episodeTitle).length;
@@ -1116,7 +1166,15 @@ function MetadataGroupCard({
         <div className="group-score"><ConfidencePill confidence={group.matches.some(match => match.confidence === 'high') ? 'high' : group.matches[0].confidence} /><span>{average}/100 avg.</span></div>
       </summary>
       <div className="match-rows">
-        {group.matches.map(match => <MetadataMatchRow key={`${runId}:${match.inventoryId}`} match={match} runId={runId} onSaveCorrection={onSaveCorrection} />)}
+        {group.matches.map(match => <MetadataMatchRow
+          key={`${runId}:${match.inventoryId}`}
+          match={match}
+          runId={runId}
+          onSaveCorrection={onSaveCorrection}
+          onApproveStorageProposal={onApproveStorageProposal}
+          writes={writes}
+          metadataApplying={metadataApplying}
+        />)}
       </div>
     </details>
   );
@@ -1126,6 +1184,9 @@ function MetadataMatchRow({
   match,
   runId,
   onSaveCorrection,
+  onApproveStorageProposal,
+  writes,
+  metadataApplying,
 }: {
   match: MetadataMatch;
   runId: number | null;
@@ -1133,6 +1194,9 @@ function MetadataMatchRow({
     match: MetadataMatch,
     correction: { candidateId: number; title: string; year: number | null; season: number | null; episode: number | null },
   ) => Promise<void>;
+  onApproveStorageProposal: (match: MetadataMatch) => Promise<void>;
+  writes: boolean;
+  metadataApplying: boolean;
 }) {
   return (
     <article className="match-row">
@@ -1140,6 +1204,19 @@ function MetadataMatchRow({
         <div className="match-path">{match.rel}</div>
         {match.episodeTitle && <div className="episode-title">{match.season != null && match.episode != null ? `S${String(match.season).padStart(2, '0')}E${String(match.episode).padStart(2, '0')} · ` : ''}{match.episodeTitle}</div>}
         {match.proposedRel && <div className="match-proposal"><span>Proposed</span><code>{match.proposedRel}</code></div>}
+        {match.rel.startsWith('storage/') && match.proposedRel && match.manualCorrection && (
+          <div className="review-actions">
+            <button
+              className="small-button"
+              disabled={!writes || metadataApplying}
+              title={!writes ? 'Enable write mode and read-write media mounts first' : ''}
+              onClick={() => void onApproveStorageProposal(match)}
+            >
+              {metadataApplying ? 'Applying...' : 'Approve & rename HDD file'}
+            </button>
+            {!writes && <small>Write mode is required; HDD suggestions are never auto-applied.</small>}
+          </div>
+        )}
       </div>
       <div className="match-row-score">
         <ConfidencePill confidence={match.confidence} />

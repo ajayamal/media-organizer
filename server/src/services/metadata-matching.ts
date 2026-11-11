@@ -48,7 +48,7 @@ export function createMetadataProposal(input: {
   episode?: number | null;
   extension: string;
 }): string | null {
-  const categories = ['movies/Anime', 'movies/Movies', 'shows/Anime', 'shows/Tv Shows'];
+  const categories = ['movies/Anime', 'movies/Movies', 'shows/Anime', 'shows/Tv Shows', 'storage/Movies', 'storage/TV Shows'];
   if (!categories.includes(input.category) || !/^\.[a-z0-9]{1,8}$/i.test(input.extension)) return null;
   const title = safeMetadataName(input.title);
   if (input.type === 'movie') {
@@ -98,7 +98,7 @@ export function parseMediaPath(rel: string, category: string): ParsedMedia {
   const parts = rel.split('/');
   const filename = parts.at(-1) || '';
   const { stem, extension } = stripExtension(filename);
-  const type: MediaType = category.startsWith('movies/') ? 'movie' : 'tv';
+  const type: MediaType = category.startsWith('movies/') || category === 'storage/Movies' ? 'movie' : 'tv';
 
   if (filename.startsWith('._')
     || parts.some(part => /^(extras?|specials?|featurettes?|behind the scenes|ncop|nced)$/i.test(part))

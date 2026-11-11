@@ -100,3 +100,16 @@ test('verifies cleanup candidates and quarantine files by exact hash', async t =
   const quarantined = await audit.verifyQuarantineFile(path.relative(root, quarantineRel), hash);
   assert.equal(quarantined.bytes, contents.length);
 });
+
+test('audits storage files while excluding hidden quarantine data', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'media-organizer-storage-audit-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, 'storage/Unsorted'), { recursive: true });
+  await mkdir(path.join(root, 'storage/.media-organizer-quarantine/7'), { recursive: true });
+  await writeFile(path.join(root, 'storage/Unsorted/caption.srt'), 'visible');
+  await writeFile(path.join(root, 'storage/.media-organizer-quarantine/7/hidden.srt'), 'hidden');
+
+  const { db, files } = createDatabase();
+  await new FileAudit(db as never, root, ['storage']).run(1);
+  assert.deepEqual([...files.keys()], ['storage/Unsorted/caption.srt']);
+});

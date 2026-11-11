@@ -21,6 +21,7 @@ services:
     volumes:
       - /srv/data/movies:/media/movies:ro
       - /srv/data/shows:/media/shows:ro
+      - /srv/storage:/media/storage:ro
       - organizer-data:/app/data
     security_opt:
       - no-new-privileges:true
