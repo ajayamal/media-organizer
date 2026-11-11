@@ -192,6 +192,9 @@ function App() {
   const [auditError, setAuditError] = useState('');
   const [auditQuery, setAuditQuery] = useState('');
   const [quarantineEntries, setQuarantineEntries] = useState<QuarantineEntry[]>([]);
+  const [emptyFolders, setEmptyFolders] = useState<string[] | null>(null);
+  const [emptyFolderBusy, setEmptyFolderBusy] = useState(false);
+  const [emptyFolderError, setEmptyFolderError] = useState('');
 
   const load = async () => {
     const [inventory, history, quarantine] = await Promise.all([
@@ -289,6 +292,53 @@ function App() {
     const result = await api<{ count: number }>('/scan', 'POST');
     setMsg(`Scanned ${result.count} media files.`);
   });
+
+  const scanEmptyFolders = async () => {
+    setEmptyFolderBusy(true);
+    setEmptyFolderError('');
+    try {
+      const result = await api<{ folders: string[] }>('/empty-folders/scan', 'POST');
+      setEmptyFolders(result.folders);
+    } catch (error) {
+      setEmptyFolderError(error instanceof Error ? error.message : 'Unable to scan for empty folders.');
+    } finally {
+      setEmptyFolderBusy(false);
+    }
+  };
+
+  const removeEmptyFolders = async () => {
+    if (!emptyFolders?.length) return;
+    if (!writes) {
+      setEmptyFolderError('Enable write mode in the deployment configuration before removing folders.');
+      return;
+    }
+    const roots = emptyFolders.filter(folder =>
+      !emptyFolders.some(parent => folder !== parent && folder.startsWith(`${parent}/`)),
+    );
+    if (!window.confirm(
+      `Remove ${emptyFolders.length} empty folder(s) under the media library?\n\n`
+      + `This includes ${roots.length} empty folder tree(s). No files will be removed.`,
+    )) return;
+
+    setEmptyFolderBusy(true);
+    setEmptyFolderError('');
+    try {
+      const result = await api<{ removed: string[]; failures: Array<{ rel: string; error: string }> }>(
+        '/empty-folders/remove',
+        'POST',
+        { folders: roots },
+      );
+      setMsg(`${result.removed.length} empty folder(s) removed.${result.failures.length ? ` ${result.failures.length} folder(s) were kept because they changed or could not be removed.` : ''}`);
+      await scanEmptyFolders();
+      if (result.failures.length) {
+        setEmptyFolderError(result.failures.map(failure => `${failure.rel}: ${failure.error}`).join('; '));
+      }
+    } catch (error) {
+      setEmptyFolderError(error instanceof Error ? error.message : 'Unable to remove empty folders.');
+    } finally {
+      setEmptyFolderBusy(false);
+    }
+  };
 
   const startMatching = async () => {
     setMatchingBusy(true);
@@ -541,6 +591,34 @@ function App() {
               <article><div className="stat-icon"><HardDrive size={19} /></div><span>Media size</span><strong>{(totalBytes / 1024 ** 3).toFixed(1)} GB</strong><small>Indexed videos only</small></article>
               <article><div className="stat-icon green"><Check size={19} /></div><span>Ready to rename</span><strong>{high}</strong><small>High-confidence suggestions</small></article>
               <article><div className="stat-icon amber"><AlertTriangle size={19} /></div><span>Needs review</span><strong>{review}</strong><small>Ambiguous or special files</small></article>
+            </section>
+            <section className="panel empty-folder-panel">
+              <div className="panel-top">
+                <div>
+                  <h2>Empty folders</h2>
+                  <p>Find folders left empty after organizing. Only empty directories are eligible; no files are removed.</p>
+                </div>
+                <div className="controls">
+                  <button className="small-button" disabled={emptyFolderBusy} onClick={() => void scanEmptyFolders()}>
+                    {emptyFolderBusy ? 'Checking...' : emptyFolders === null ? 'Find empty folders' : 'Refresh'}
+                  </button>
+                  {emptyFolders && emptyFolders.length > 0 && (
+                    <button className="small-button" disabled={!writes || emptyFolderBusy} title={!writes ? 'Enable write mode and read-write media mounts first' : ''} onClick={() => void removeEmptyFolders()}>
+                      Remove {emptyFolders.length.toLocaleString()} empty folders
+                    </button>
+                  )}
+                </div>
+              </div>
+              {!writes && <p className="empty-folder-help">Write mode and read-write media mounts are required to remove folders.</p>}
+              {emptyFolderError && <p className="error-text">{emptyFolderError}</p>}
+              {emptyFolders !== null && (
+                emptyFolders.length === 0
+                  ? <div className="empty">No empty folders found in the media library.</div>
+                  : <div className="empty-folder-list">
+                    {emptyFolders.slice(0, 200).map(folder => <code key={folder}>{folder}</code>)}
+                    {emptyFolders.length > 200 && <small>Showing 200 of {emptyFolders.length.toLocaleString()} empty folders.</small>}
+                  </div>
+              )}
             </section>
             <section className="panel">
               <div className="panel-top">

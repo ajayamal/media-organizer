@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { MetadataMatcher } from './services/metadata-matcher.js';
 import { LmStudioClient } from './services/lm-studio.js';
 import { FileAudit } from './services/file-audit.js';
+import { findEmptyFolders, removeEmptyFolders } from './services/empty-folders.js';
 import { TmdbClient } from './services/tmdb.js';
 import { createMetadataProposal, parseMediaPath, safeMetadataName } from './services/metadata-matching.js';
 
@@ -146,7 +147,7 @@ app.get('/api/status',async(req,reply)=>({
 app.post('/api/metadata/match',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
  if(!process.env.TMDB_READ_TOKEN?.trim())return reply.code(503).send({error:'Metadata matching is unavailable: TMDB_READ_TOKEN is not configured.'});
  if(AUTO_APPLY_HIGH_CONFIDENCE&&!WRITE_ENABLED)return reply.code(403).send({error:'AUTO_APPLY_HIGH_CONFIDENCE requires ENABLE_WRITES=true and read-write media mounts.'});
- if(scanning||auditing||quarantining||metadataMatching)return reply.code(409).send({error:'A scan, audit, cleanup, or metadata matching run is already in progress.'});
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return reply.code(409).send({error:'A scan, audit, cleanup, or metadata matching run is already in progress.'});
  const active=db.prepare("SELECT id FROM metadata_match_runs WHERE status IN ('queued','running') LIMIT 1").get() as {id:number}|undefined;
  if(active)return reply.code(409).send({error:'A metadata matching run is already in progress.',runId:active.id});
  const count=(db.prepare('SELECT COUNT(*) AS count FROM inventory').get() as {count:number}).count;
@@ -389,6 +390,7 @@ let scanning=false;
 let auditing=false;
 let quarantining=false;
 let metadataMatching=false;
+let emptyFolderBusy=false;
 function updateAuditDuplicateSummary(runId:number){
  const summary=db.prepare(`SELECT COUNT(*) AS groups,COALESCE(SUM(file_count),0) AS files FROM (
   SELECT COUNT(*) AS file_count FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL AND quarantined=0
@@ -399,7 +401,7 @@ function updateAuditDuplicateSummary(runId:number){
 }
 app.post('/api/audit/:id/quarantine',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; duplicate cleanup requires explicit write mode.',403);
- if(scanning||auditing||quarantining||metadataMatching)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
  const runId=Number(req.params?.id);
  if(!Number.isSafeInteger(runId)||runId<1)return error(reply,'Invalid file audit run id.');
  const run=db.prepare('SELECT status FROM file_audit_runs WHERE id=?').get(runId) as {status:string}|undefined;
@@ -486,7 +488,7 @@ app.post('/api/audit/:id/quarantine',{preHandler:[requireOrigin,requireAuth]},as
 });
 app.post('/api/quarantine/:id/restore',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; restoring quarantined files requires explicit write mode.',403);
- if(scanning||auditing||quarantining||metadataMatching)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
  const id=Number(req.params?.id);
  if(!Number.isSafeInteger(id)||id<1)return error(reply,'Invalid quarantine record id.');
  const item=db.prepare('SELECT * FROM file_quarantine WHERE id=?').get(id) as any;
@@ -519,7 +521,7 @@ app.post('/api/quarantine/:id/restore',{preHandler:[requireOrigin,requireAuth]},
  }finally{quarantining=false;}
 });
 app.post('/api/audit',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
- if(scanning||auditing||quarantining||metadataMatching)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
+ if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
  const startedAt=new Date().toISOString();
  const info=db.prepare("INSERT INTO file_audit_runs (status,started_at) VALUES ('queued',?)").run(startedAt);
  const runId=Number(info.lastInsertRowid);
@@ -565,8 +567,36 @@ app.get('/api/quarantine',{preHandler:requireAuth},async()=>({
   bytes,status,error,created_at AS createdAt FROM file_quarantine WHERE status IN ('quarantined','moving','failed')
   ORDER BY id DESC`).all(),
 }));
+app.post('/api/empty-folders/scan',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
+  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return error(reply,'A scan, audit, cleanup, or metadata matching run is already running.',409);
+  emptyFolderBusy=true;
+  try{
+   return {folders:await findEmptyFolders(ROOT,categories)};
+  }catch(e){
+   req.log.error({err:e},'Failed to scan for empty media folders');
+   return error(reply,`Empty-folder scan failed: ${e instanceof Error?e.message:'Unknown filesystem error.'}`,500);
+  }finally{emptyFolderBusy=false;}
+});
+app.post('/api/empty-folders/remove',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
+  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; removing empty folders requires explicit write mode.',403);
+  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return error(reply,'A scan, audit, cleanup, or metadata matching run is already running.',409);
+  const folders=req.body?.folders;
+  if(!Array.isArray(folders)||folders.length===0||folders.length>1000||!folders.every((folder:unknown)=>typeof folder==='string')){
+   return error(reply,'Select between 1 and 1,000 scanned empty folder trees to remove.');
+  }
+  emptyFolderBusy=true;
+  try{
+   return await removeEmptyFolders(ROOT,categories,folders);
+  }catch(e){
+   const message=e instanceof Error?e.message:'Unknown filesystem error.';
+   if(message.startsWith('Folder is no longer empty or is outside the library:'))return error(reply,message,409);
+   if(message.startsWith('Select between '))return error(reply,message,400);
+   req.log.error({err:e},'Failed to remove empty media folders');
+   return error(reply,`Empty-folder cleanup failed: ${message}`,500);
+  }finally{emptyFolderBusy=false;}
+});
 app.post('/api/scan',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
- if(scanning||auditing||quarantining||metadataMatching)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
+  if(scanning||auditing||quarantining||metadataMatching||emptyFolderBusy)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
  scanning=true;
  try{
   const rows:Array<{id:string,rel:string,bytes:number,category:string,issue:string,proposal:string|null,confidence:string,scanned_at:string}>=[];
@@ -596,7 +626,7 @@ app.get('/api/operations',{preHandler:requireAuth},async()=>({items:db.prepare('
 function error(reply:any,msg:string,status=400){return reply.code(status).send({error:msg});}
 app.post('/api/apply',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled',403);
- if(metadataMatching)return error(reply,'Wait for metadata matching to finish before applying a rename.',409);
+ if(metadataMatching||emptyFolderBusy)return error(reply,'Wait for the active filesystem operation to finish before applying a rename.',409);
  const {id,expectedProposal}=req.body||{};
  if(typeof id!=='string'||typeof expectedProposal!=='string')return error(reply,'Invalid request');
  const item=db.prepare('SELECT * FROM inventory WHERE id=?').get(id) as any;
@@ -617,7 +647,7 @@ app.post('/api/apply',{preHandler:[requireOrigin,requireAuth]},async(req:any,rep
 });
 app.post('/api/undo',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled',403);
- if(metadataMatching)return error(reply,'Wait for metadata matching to finish before undoing a rename.',409);
+ if(metadataMatching||emptyFolderBusy)return error(reply,'Wait for the active filesystem operation to finish before undoing a rename.',409);
  const id=req.body?.id;
  if(!Number.isSafeInteger(id))return error(reply,'Invalid operation id');
  const op=db.prepare('SELECT * FROM operations WHERE id=?').get(id) as any;

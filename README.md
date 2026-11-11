@@ -13,6 +13,7 @@ A self-hosted React + TypeScript dashboard, Fastify API, SQLite inventory and re
 - **File scanning:** the library scan recursively indexes video extensions and excludes symlink entries. The File audit scan also skips symlinks and does not change files; selected duplicate cleanup is a separate, explicit quarantine action.
 - **Duplicate detection:** the File audit first groups files by size, then streams SHA-256 only for files in repeated-size groups. Only identical hashes are reported as duplicates. Files changing during hashing are reported as errors and are not treated as verified duplicates.
 - **Duplicate cleanup:** after enabling write mode, select the copy to keep and explicitly confirm moving non-video duplicates into `.media-organizer-quarantine` under the media root. Cleanup rechecks the file hashes and never removes video files. The audit page offers a restore action; a restore is blocked if the original path is occupied or the quarantined content changed.
+- **Empty-folder cleanup:** the Library page can preview empty directory trees under configured media categories and remove them only after explicit confirmation and with write mode enabled. Hidden folders and category roots are excluded. The server rechecks folders immediately before removal and uses non-recursive directory removal, so files are never deleted.
 - **Non-video inventory:** subtitles, artwork, metadata sidecars, and archives are listed. Other extensions are summarized by extension and count. macOS `._` files are included in audit results but remain preserved by the rename workflow.
 - **Security:** password login (scrypt), HTTP-only SameSite=Strict cookie, same-origin checks for writes, no Docker socket, no public port binding. No TLS built into app: use SSH tunnel or private HTTPS reverse proxy. No built-in login rate limiting; restrict access to trusted networks. Password must be >=16 characters.
 - **Not production-hardened against malicious local users who can mutate the same folders concurrently.** Use a dedicated trusted server and avoid concurrent renames from other programs.
@@ -79,7 +80,7 @@ Use **File audit** to run a separate read-only scan. It compares exact file cont
 
 ## Enabling approved file changes
 
-**Do not enable write mode until you have reviewed the proposals and backed up the SQLite volume and important media metadata.** Write mode enables individually approved renames and moving verified duplicate non-video files into quarantine. It does not expose permanent file deletion.
+**Do not enable write mode until you have reviewed the proposals and backed up the SQLite volume and important media metadata.** Write mode enables individually approved renames, reversible quarantine of verified duplicate non-video files, and explicit removal of empty folders. It does not expose permanent file deletion or removal of non-empty directories.
 
 ### CLI Compose
 
@@ -108,6 +109,8 @@ In the existing stack editor, explicitly change **both** media volume modes from
 - `POST /api/login` — password login
 - `POST /api/logout` — logout
 - `POST /api/scan` — scan library (authenticated)
+- `POST /api/empty-folders/scan` — preview empty folders under media categories (authenticated)
+- `POST /api/empty-folders/remove` — remove previously scanned empty folder trees (authenticated, write mode required)
 - `POST /api/audit` — start an asynchronous read-only duplicate and non-video file audit (authenticated)
 - `GET /api/audit/:id` — get audit progress, exact duplicate groups, media-related files, and other-extension counts (authenticated)
 - `POST /api/audit/:id/quarantine` — quarantine selected verified non-video duplicates (authenticated, write mode required)
