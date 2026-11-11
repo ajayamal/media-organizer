@@ -55,10 +55,11 @@ In LM Studio, load the desired model and start the Developer server with network
 
 ```dotenv
 LM_STUDIO_BASE_URL=http://192.168.0.110:1234/v1
-LM_STUDIO_MODEL=Qwen3.6 14B A3B FableVibes
+LM_STUDIO_MODEL=qwen3.6-14b-a3b-fablevibes
+LM_STUDIO_API_TOKEN=
 ```
 
-Allow inbound access to LM Studio's API port only from the organizer host on your trusted private network; do not expose it to the public internet. Restart/redeploy the organizer after changing these settings. Both variables must be set together. If LM Studio is unreachable or returns invalid suggestions, the run continues with deterministic TMDB matching and records the fallback reason in the result explanation. With AI unset, existing matching behavior is unchanged.
+If LM Studio API authentication is enabled, set `LM_STUDIO_API_TOKEN` to the token configured in LM Studio. Keep this secret in the server's environment or Portainer secret settings; never commit it or put it in frontend code. Allow inbound access to LM Studio's API port only from the organizer host on your trusted private network; do not expose it to the public internet. Restart/redeploy the organizer after changing these settings. The base URL and model variables must be set together. If LM Studio is unreachable or returns invalid suggestions, the run continues with deterministic TMDB matching and records the fallback reason in the result explanation. With AI unset, existing matching behavior is unchanged.
 
 Use **File audit** to run a separate read-only scan. It compares exact file contents for same-size candidates using SHA-256, lists common media sidecars (such as subtitles, artwork, metadata, and archives), and summarizes other extensions. Responses include up to 500 duplicate groups, 5,000 duplicate paths, and 2,000 non-video files; summary counts include the full scan.
 
@@ -72,7 +73,7 @@ Use **File audit** to run a separate read-only scan. It compares exact file cont
    ```
 
 2. In Portainer, select the **local** Docker environment, then **Stacks > Add stack > Web editor**. Name it `media-organizer`.
-3. Paste the contents of `portainer-stack.yaml`. Add the environment variable `ADMIN_PASSWORD` in Portainer's stack environment variables section (strong, unique password, >=16 characters). To enable LM Studio, also add `LM_STUDIO_BASE_URL` and `LM_STUDIO_MODEL`. Do not paste the admin password into the YAML.
+3. Paste the contents of `portainer-stack.yaml`. Add the environment variable `ADMIN_PASSWORD` in Portainer's stack environment variables section (strong, unique password, >=16 characters). To enable LM Studio, also add `LM_STUDIO_BASE_URL` and `LM_STUDIO_MODEL`, and add `LM_STUDIO_API_TOKEN` if API authentication is enabled. Do not paste secrets into the YAML.
 4. Deploy. Portainer uses the image built on the same local Docker host. Use the SSH tunnel described above to access it.
 5. To update the image later, rebuild on the host and recreate the service using Portainer's redeploy/pull-disabled options or `docker compose up -d --force-recreate` if using CLI deployment. **Do not deploy both CLI Compose and Portainer stacks simultaneously**, since they use the same container name/port.
 

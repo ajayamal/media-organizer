@@ -81,7 +81,9 @@ const lmStudioModel = process.env.LM_STUDIO_MODEL?.trim() || '';
 if (Boolean(lmStudioBaseUrl) !== Boolean(lmStudioModel)) {
   throw new Error('Configure both LM_STUDIO_BASE_URL and LM_STUDIO_MODEL, or leave both unset.');
 }
-const lmStudioClient = lmStudioBaseUrl ? new LmStudioClient(lmStudioBaseUrl, lmStudioModel) : null;
+const lmStudioClient = lmStudioBaseUrl
+  ? new LmStudioClient(lmStudioBaseUrl, lmStudioModel, process.env.LM_STUDIO_API_TOKEN?.trim() || '')
+  : null;
 const metadataMatcher = new MetadataMatcher(db, process.env.TMDB_READ_TOKEN || '', lmStudioClient);
 const fileAudit = new FileAudit(db, ROOT, categories);
 const tmdbClient = new TmdbClient(db, process.env.TMDB_READ_TOKEN || '');

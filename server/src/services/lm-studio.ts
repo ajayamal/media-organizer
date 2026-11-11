@@ -11,7 +11,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export class LmStudioClient {
   private readonly baseUrl: string;
 
-  constructor(baseUrl: string, private readonly model: string) {
+  constructor(baseUrl: string, private readonly model: string, private readonly apiToken = '') {
     let url: URL;
     try {
       url = new URL(baseUrl);
@@ -42,7 +42,11 @@ export class LmStudioClient {
     try {
       response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          ...(this.apiToken ? { Authorization: `Bearer ${this.apiToken}` } : {}),
+        },
         body: JSON.stringify({
           model: this.model,
           messages: [
