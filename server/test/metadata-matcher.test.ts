@@ -3,12 +3,15 @@ import test from 'node:test';
 import { MetadataMatcher } from '../src/services/metadata-matcher.js';
 import { LmStudioClient } from '../src/services/lm-studio.js';
 
-function createDatabase(correction?: Record<string, unknown>, inventoryOverride?: { id: string; rel: string; category: string }) {
+function createDatabase(correction?: Record<string, unknown>, inventoryOverride?: { id: string; rel: string; category: string; bytes?: number }) {
   const bindings: Array<Record<string, unknown>> = [];
-  const inventory = inventoryOverride ?? {
+  const inventory = {
+    ...(inventoryOverride ?? {
     id: 'movie-1',
     rel: 'movies/Movies/Example (2020)/Example.mkv',
     category: 'movies/Movies',
+    }),
+    bytes: inventoryOverride?.bytes ?? 123,
   };
   const db = {
     prepare(sql: string) {
@@ -34,6 +37,57 @@ function createDatabase(correction?: Record<string, unknown>, inventoryOverride?
   };
   return { db, bindings };
 }
+
+test('auto-applies deterministic high-confidence matches and retains the renamed inventory entry', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async url => new Response(JSON.stringify(
+    String(url).includes('/alternative_titles')
+      ? { titles: [] }
+      : { results: [{ id: 1, title: 'Example', original_title: 'Example', release_date: '2020-01-01' }] },
+  ), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  try {
+    const result = createDatabase();
+    let applied = 0;
+    await new MetadataMatcher(result.db as never, 'test-token', null, async record => {
+      applied++;
+      assert.equal(record.inventoryId, 'movie-1');
+      assert.equal(record.bytes, 123);
+      assert.equal(record.proposedRel, 'movies/Movies/Example (2020)/Example (2020).mkv');
+      return { ok: true, inventoryId: 'renamed-id', rel: record.proposedRel };
+    }).run(1);
+    assert.equal(applied, 1);
+    assert.equal(result.bindings[0].inventoryId, 'renamed-id');
+    assert.equal(result.bindings[0].rel, 'movies/Movies/Example (2020)/Example (2020).mkv');
+    assert.equal(result.bindings[0].proposedRel, null);
+    assert.equal(result.bindings[0].autoApplied, 1);
+    assert.equal(result.bindings[0].aiAssisted, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('keeps the proposal reviewable when a safe automatic rename is rejected', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async url => new Response(JSON.stringify(
+    String(url).includes('/alternative_titles')
+      ? { titles: [] }
+      : { results: [{ id: 1, title: 'Example', original_title: 'Example', release_date: '2020-01-01' }] },
+  ), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  try {
+    const result = createDatabase();
+    await new MetadataMatcher(result.db as never, 'test-token', null, async () => ({
+      ok: false,
+      reason: 'Destination already exists.',
+    })).run(1);
+    assert.equal(result.bindings[0].autoApplied, 0);
+    assert.equal(result.bindings[0].proposedRel, 'movies/Movies/Example (2020)/Example (2020).mkv');
+    assert.ok(String(result.bindings[0].explanations).includes('Destination already exists.'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test('binds correction flags as SQLite integers', async () => {
   const originalFetch = globalThis.fetch;
@@ -61,8 +115,13 @@ test('binds correction flags as SQLite integers', async () => {
       season: null,
       episode: null,
     });
-    await new MetadataMatcher(corrected.db as never, '').run(1);
+    let autoApplyCalls = 0;
+    await new MetadataMatcher(corrected.db as never, '', null, async () => {
+      autoApplyCalls++;
+      return { ok: true, inventoryId: 'unexpected', rel: 'unexpected' };
+    }).run(1);
     assert.equal(corrected.bindings[0].manualCorrection, 1);
+    assert.equal(autoApplyCalls, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -94,10 +153,16 @@ test('uses LM Studio title suggestions to recover uncertain matches without auto
       category: 'movies/Movies',
     });
     const ai = new LmStudioClient('http://127.0.0.1:1234/v1', 'test-model');
-    await new MetadataMatcher(result.db as never, 'test-token', ai).run(1);
+    let autoApplyCalls = 0;
+    await new MetadataMatcher(result.db as never, 'test-token', ai, async () => {
+      autoApplyCalls++;
+      return { ok: true, inventoryId: 'unexpected', rel: 'unexpected' };
+    }).run(1);
     assert.equal(result.bindings[0].title, 'Example');
     assert.equal(result.bindings[0].confidence, 'medium');
     assert.equal(result.bindings[0].matchStatus, 'review');
+    assert.equal(result.bindings[0].aiAssisted, 1);
+    assert.equal(autoApplyCalls, 0);
     assert.ok(String(result.bindings[0].explanations).includes('LM Studio'));
   } finally {
     globalThis.fetch = originalFetch;

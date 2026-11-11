@@ -5,9 +5,9 @@ A self-hosted React + TypeScript dashboard, Fastify API, SQLite inventory and re
 ## Safeguards and limitations
 
 - **Read-only by default:** the Docker media mounts use `:ro`, and `ENABLE_WRITES=false` independently disables changes.
-- **No permanent-delete endpoint or automatic bulk changes.** Exact duplicate non-video files can be moved individually to a reversible quarantine after selecting a copy to keep and confirming the action. Each high-confidence rename also requires explicit confirmation. Ambiguous anime absolute-numbered episodes, extras, OVAs, and inconsistent season numbers are *review only*.
+- **No permanent-delete endpoint.** Exact duplicate non-video files can be moved individually to a reversible quarantine after selecting a copy to keep and confirming the action. Renames require explicit confirmation by default. An additional opt-in can automatically apply deterministic high-confidence metadata matches; ambiguous anime absolute-numbered episodes, extras, OVAs, inconsistent season numbers, and AI-assisted matches remain *review only*.
 - **No subtitle renaming yet.** Subtitles are left intact; do not apply a rename to a video with sidecar subtitles until this feature is added. Embedded subtitles are unaffected.
-- **Metadata matching is read-only.** TMDB supplies provider candidates and episode data; optional LM Studio assistance suggests alternate title searches only for uncertain matches. AI-assisted results remain in review and never rename files automatically.
+- **Metadata matching writes are opt-in.** TMDB supplies provider candidates and episode data; optional LM Studio assistance suggests alternate title searches only for uncertain matches. AI-assisted and manually corrected results are never auto-applied. Automatic renames validate paths, source size, collisions, and symlinks, refuse to move videos with sidecar subtitles, and use the operation journal.
 - **Collision protection:** exclusive hard-link creation prevents overwriting a destination. Moves remain within the same underlying filesystem; the app rejects cross-filesystem hard links.
 - **Undo:** records successful operations in SQLite; undo fails safely if the old name is occupied or the renamed file is missing. A process crash between filesystem change and journal write can leave an unjournaled rename, so this is **best-effort rollback, not transactional backup**.
 - **File scanning:** the library scan recursively indexes video extensions and excludes symlink entries. The File audit scan also skips symlinks and does not change files; selected duplicate cleanup is a separate, explicit quarantine action.
@@ -130,7 +130,17 @@ After scanning, an authenticated `POST /api/metadata/match` starts a background 
 
 Scores are deterministic (title similarity, year evidence, and media type): 90–100 is high, 70–89 medium, and below 70 low. These are heuristic scores, not probabilities. Ambiguity, year conflicts, and episode safety checks can prevent high-confidence classification regardless of score.
 
-Episode proposals require a standard `SxxEyy` filename and a matching TMDB season/episode. Absolute anime episode numbers, specials, conflicting season folders, ambiguous candidates, and year mismatches remain in review. This phase only writes matching metadata to the app database; it never renames files.
+Episode proposals require a standard `SxxEyy` filename and a matching TMDB season/episode. Absolute anime episode numbers, specials, conflicting season folders, ambiguous candidates, and year mismatches remain in review.
+
+Automatic metadata renaming is disabled by default. To enable it, first review the proposals and back up the media, then set `AUTO_APPLY_HIGH_CONFIDENCE=true` in `.env` and use the explicit write-mode Compose override:
+
+```bash
+docker compose -f compose.yaml -f compose.write.yaml up -d --build
+```
+
+Both `ENABLE_WRITES=true` and read-write media mounts are required. When enabled, matching automatically applies only deterministic high-confidence proposals; AI-assisted and manually corrected matches stay in review. Sidecar subtitles block automatic renames. Successful changes are kept in the operation history and can be undone there. Undo restores the file and inventory entry. This setting can apply multiple eligible files during one run, so enable it only after backing up and reviewing a read-only run.
+
+In Portainer, set `AUTO_APPLY_HIGH_CONFIDENCE=true` in the stack environment and explicitly change `ENABLE_WRITES` to `"true"` and both media mounts from `:ro` to `:rw`. Re-deploy the stack for the settings to take effect.
 
 The metadata tab includes a review queue. Choose among stored provider candidates, edit the display title/year, and for TV verify or correct the season/episode mapping. The server verifies episode mappings with TMDB, computes the destination from the inventory record (never from a client-supplied path), and stores the correction by media path for future scans and matching runs. Corrections update metadata only and do not execute renames.
 

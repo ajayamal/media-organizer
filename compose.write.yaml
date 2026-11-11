@@ -1,9 +1,11 @@
 # Opt-in override. Use ONLY after reviewing proposals and taking a backup.
-# Enables approved renames and reversible duplicate quarantine; see README.
+# Enables approved renames and reversible duplicate quarantine; automatic metadata
+# renames remain separately disabled unless AUTO_APPLY_HIGH_CONFIDENCE=true.
 services:
   organizer:
     environment:
       ENABLE_WRITES: "true"
+      AUTO_APPLY_HIGH_CONFIDENCE: ${AUTO_APPLY_HIGH_CONFIDENCE:-false}
     volumes:
       - /srv/data/movies:/media/movies:rw
       - /srv/data/shows:/media/shows:rw

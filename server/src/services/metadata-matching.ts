@@ -35,6 +35,7 @@ export interface ScoredMatch {
   candidates: MetadataCandidate[];
   score: number;
   confidence: Confidence;
+  aiAssisted: boolean;
   explanations: string[];
 }
 
@@ -188,10 +189,10 @@ export function scoreCandidates(
   assistedTitles: string[] = [],
 ): ScoredMatch {
   if (parsed.preservedReason) {
-    return { candidates: [], score: 0, confidence: 'preserved', explanations: [parsed.preservedReason] };
+    return { candidates: [], score: 0, confidence: 'preserved', aiAssisted: false, explanations: [parsed.preservedReason] };
   }
   if (!parsed.title && assistedTitles.length === 0) {
-    return { candidates: [], score: 0, confidence: 'unmatched', explanations: ['No reliable title could be extracted.'] };
+    return { candidates: [], score: 0, confidence: 'unmatched', aiAssisted: false, explanations: ['No reliable title could be extracted.'] };
   }
 
   const ranked = candidates.map(candidate => {
@@ -220,7 +221,7 @@ export function scoreCandidates(
     .sort((a, b) => b.score - a.score || a.id - b.id);
 
   if (!ranked.length) {
-    return { candidates: [], score: 0, confidence: 'unmatched', explanations: ['No provider candidate had a reliable title match.'] };
+    return { candidates: [], score: 0, confidence: 'unmatched', aiAssisted: false, explanations: ['No provider candidate had a reliable title match.'] };
   }
 
   const ambiguous = ranked.length > 1 && ranked[0].score - ranked[1].score < 8;
@@ -233,15 +234,10 @@ export function scoreCandidates(
   let confidence: Confidence = ambiguous || yearConflict || parsed.episodeStyle === 'absolute'
     ? best.score >= 70 ? 'medium' : 'low'
     : best.score >= 90 ? 'high' : best.score >= 70 ? 'medium' : 'low';
-  const originalSimilarity = Math.max(0, ...[best.title, best.originalTitle, ...best.aliases]
-    .filter(Boolean)
-    .map(alias => titleSimilarity(parsed.title, alias)));
-  const aiAssisted = assistedTitles.some(title => titleSimilarity(title, best.title) > originalSimilarity
-    || titleSimilarity(title, best.originalTitle) > originalSimilarity
-    || best.aliases.some(alias => titleSimilarity(title, alias) > originalSimilarity));
+  const aiAssisted = assistedTitles.some(title => normalizeTitle(title) !== normalizeTitle(parsed.title));
   if (aiAssisted && confidence === 'high') {
     confidence = 'medium';
-    best.explanations.push('This match relied on an AI-suggested title and remains in review for confirmation.');
+    best.explanations.push('LM Studio supplied an alternate search title, so this result remains in review for confirmation.');
   }
   if (yearConflict) best.explanations.push('Year mismatch blocks high-confidence approval.');
   if (parsed.episodeStyle === 'absolute') best.explanations.push('Absolute episode numbering has no verified season mapping.');
@@ -250,6 +246,7 @@ export function scoreCandidates(
     candidates: ranked.slice(0, 5),
     score: best.score,
     confidence,
+    aiAssisted,
     explanations: best.explanations,
   };
 }

@@ -15,7 +15,9 @@ import { createMetadataProposal, parseMediaPath, safeMetadataName } from './serv
 const ROOT = path.resolve(process.env.MEDIA_ROOT || '/media');
 const DATA = path.resolve(process.env.DATA_DIR || '/app/data');
 const WRITE_ENABLED = process.env.ENABLE_WRITES === 'true';
+const AUTO_APPLY_HIGH_CONFIDENCE = process.env.AUTO_APPLY_HIGH_CONFIDENCE === 'true';
 const videoExt=new Set(['.mkv','.mp4','.avi','.m4v','.mov','.webm']);
+const subtitleExt=new Set(['.srt','.ass','.ssa','.sub','.idx','.vtt','.smi','.scc']);
 const categories=['movies/Anime','movies/Movies','shows/Anime','shows/Tv Shows'];
 const PASSWORD = process.env.ADMIN_PASSWORD || '';
 if (PASSWORD.length < 16) throw new Error('ADMIN_PASSWORD must contain at least 16 characters');
@@ -23,7 +25,7 @@ await fs.mkdir(DATA, {recursive:true});
 const db = new Database(path.join(DATA,'organizer.sqlite'));
 db.pragma('journal_mode = WAL');
 db.exec(`CREATE TABLE IF NOT EXISTS inventory (id TEXT PRIMARY KEY, rel TEXT NOT NULL UNIQUE, bytes INTEGER NOT NULL, category TEXT NOT NULL, issue TEXT NOT NULL, proposal TEXT, confidence TEXT NOT NULL, scanned_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS operations (id INTEGER PRIMARY KEY AUTOINCREMENT, old_rel TEXT NOT NULL, new_rel TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, undone_at TEXT);
+CREATE TABLE IF NOT EXISTS operations (id INTEGER PRIMARY KEY AUTOINCREMENT, old_rel TEXT NOT NULL, new_rel TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, undone_at TEXT, inventory_retained INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS metadata_cache (cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL, expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS metadata_matches (
@@ -31,7 +33,8 @@ CREATE TABLE IF NOT EXISTS metadata_matches (
  title TEXT, original_title TEXT, release_year INTEGER, episode_title TEXT, confidence_score INTEGER NOT NULL,
  confidence TEXT NOT NULL, match_status TEXT NOT NULL, explanations TEXT NOT NULL,
  candidates TEXT NOT NULL, season INTEGER, episode INTEGER, proposed_rel TEXT, error TEXT,
- manual_correction INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+ manual_correction INTEGER NOT NULL DEFAULT 0, ai_assisted INTEGER NOT NULL DEFAULT 0,
+ auto_applied INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
  PRIMARY KEY (run_id,inventory_id)
 );
 CREATE TABLE IF NOT EXISTS metadata_match_runs (
@@ -68,6 +71,10 @@ if(!auditFileColumns.some(column=>column.name==='quarantined'))db.exec('ALTER TA
 const matchColumns=db.prepare('PRAGMA table_info(metadata_matches)').all() as Array<{name:string}>;
 if(!matchColumns.some(column=>column.name==='manual_correction'))db.exec('ALTER TABLE metadata_matches ADD COLUMN manual_correction INTEGER NOT NULL DEFAULT 0');
 if(!matchColumns.some(column=>column.name==='episode_title'))db.exec('ALTER TABLE metadata_matches ADD COLUMN episode_title TEXT');
+if(!matchColumns.some(column=>column.name==='ai_assisted'))db.exec('ALTER TABLE metadata_matches ADD COLUMN ai_assisted INTEGER NOT NULL DEFAULT 0');
+if(!matchColumns.some(column=>column.name==='auto_applied'))db.exec('ALTER TABLE metadata_matches ADD COLUMN auto_applied INTEGER NOT NULL DEFAULT 0');
+const operationColumns=db.prepare('PRAGMA table_info(operations)').all() as Array<{name:string}>;
+if(!operationColumns.some(column=>column.name==='inventory_retained'))db.exec('ALTER TABLE operations ADD COLUMN inventory_retained INTEGER NOT NULL DEFAULT 0');
 const correctionColumns=db.prepare('PRAGMA table_info(metadata_corrections)').all() as Array<{name:string}>;
 if(!correctionColumns.some(column=>column.name==='candidate_set'))db.exec("ALTER TABLE metadata_corrections ADD COLUMN candidate_set TEXT NOT NULL DEFAULT '[]'");
 db.prepare("UPDATE metadata_match_runs SET status='failed',error='Server restarted before matching completed.',completed_at=? WHERE status IN ('queued','running')")
@@ -84,7 +91,12 @@ if (Boolean(lmStudioBaseUrl) !== Boolean(lmStudioModel)) {
 const lmStudioClient = lmStudioBaseUrl
   ? new LmStudioClient(lmStudioBaseUrl, lmStudioModel, process.env.LM_STUDIO_API_TOKEN?.trim() || '')
   : null;
-const metadataMatcher = new MetadataMatcher(db, process.env.TMDB_READ_TOKEN || '', lmStudioClient);
+const metadataMatcher = new MetadataMatcher(
+ db,
+ process.env.TMDB_READ_TOKEN || '',
+ lmStudioClient,
+ AUTO_APPLY_HIGH_CONFIDENCE && WRITE_ENABLED ? applyMetadataProposal : null,
+);
 const fileAudit = new FileAudit(db, ROOT, categories);
 const tmdbClient = new TmdbClient(db, process.env.TMDB_READ_TOKEN || '');
 app.addHook('onRequest', async (req, reply) => {
@@ -125,21 +137,29 @@ app.post('/api/logout',{preHandler:[requireOrigin,requireAuth]},async(req:any,re
  if(req.cookies.mo_session) db.prepare('DELETE FROM sessions WHERE token_hash=?').run(sha(req.cookies.mo_session));
  reply.clearCookie('mo_session',{path:'/'});return {ok:true};
 });
-app.get('/api/status',async(req,reply)=>({authenticated:auth(req),writesEnabled:WRITE_ENABLED,aiMatchingEnabled:lmStudioClient!==null}));
+app.get('/api/status',async(req,reply)=>({
+ authenticated:auth(req),
+ writesEnabled:WRITE_ENABLED,
+ aiMatchingEnabled:lmStudioClient!==null,
+ autoApplyHighConfidenceEnabled:AUTO_APPLY_HIGH_CONFIDENCE&&WRITE_ENABLED,
+}));
 app.post('/api/metadata/match',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
  if(!process.env.TMDB_READ_TOKEN?.trim())return reply.code(503).send({error:'Metadata matching is unavailable: TMDB_READ_TOKEN is not configured.'});
+ if(AUTO_APPLY_HIGH_CONFIDENCE&&!WRITE_ENABLED)return reply.code(403).send({error:'AUTO_APPLY_HIGH_CONFIDENCE requires ENABLE_WRITES=true and read-write media mounts.'});
+ if(scanning||auditing||quarantining||metadataMatching)return reply.code(409).send({error:'A scan, audit, cleanup, or metadata matching run is already in progress.'});
  const active=db.prepare("SELECT id FROM metadata_match_runs WHERE status IN ('queued','running') LIMIT 1").get() as {id:number}|undefined;
  if(active)return reply.code(409).send({error:'A metadata matching run is already in progress.',runId:active.id});
  const count=(db.prepare('SELECT COUNT(*) AS count FROM inventory').get() as {count:number}).count;
  const startedAt=new Date().toISOString();
  const info=db.prepare("INSERT INTO metadata_match_runs (status,total,started_at) VALUES ('queued',?,?)").run(count,startedAt);
  const runId=Number(info.lastInsertRowid);
+ metadataMatching=true;
  setImmediate(()=>{
   void metadataMatcher.run(runId).catch(error=>{
    const message=error instanceof Error?error.message:'Unknown metadata matching failure.';
    app.log.error({err:error,runId},'Metadata matching run failed');
    metadataMatcher.fail(runId,message);
-  });
+  }).finally(()=>{metadataMatching=false;});
  });
  return reply.code(202).send({runId,status:'queued',total:count});
 });
@@ -151,9 +171,9 @@ app.get('/api/metadata/match/:id',{preHandler:requireAuth},async(req:any,reply)=
  const matches=db.prepare(`SELECT inventory_id AS inventoryId,rel,provider_id AS providerId,provider_type AS providerType,
   title,original_title AS originalTitle,release_year AS releaseYear,episode_title AS episodeTitle,confidence_score AS confidenceScore,
   confidence,match_status AS matchStatus,explanations,candidates,season,episode,proposed_rel AS proposedRel,error,
-  manual_correction AS manualCorrection,updated_at AS updatedAt
+  manual_correction AS manualCorrection,ai_assisted AS aiAssisted,auto_applied AS autoApplied,updated_at AS updatedAt
   FROM metadata_matches WHERE run_id=? AND inventory_id IN (SELECT id FROM inventory) ORDER BY rel LIMIT 2000`).all(id);
- return {run,matches:matches.map((row:any)=>({...row,manualCorrection:Boolean(row.manualCorrection),explanations:JSON.parse(row.explanations),candidates:JSON.parse(row.candidates)}))};
+ return {run,matches:matches.map((row:any)=>({...row,manualCorrection:Boolean(row.manualCorrection),aiAssisted:Boolean(row.aiAssisted),autoApplied:Boolean(row.autoApplied),explanations:JSON.parse(row.explanations),candidates:JSON.parse(row.candidates)}))};
 });
 app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  const runId=Number(req.params?.runId);
@@ -234,10 +254,10 @@ app.patch('/api/metadata/match/:runId/:inventoryId',{preHandler:[requireOrigin,r
  const updated=db.prepare(`SELECT inventory_id AS inventoryId,rel,provider_id AS providerId,provider_type AS providerType,
   title,original_title AS originalTitle,release_year AS releaseYear,episode_title AS episodeTitle,confidence_score AS confidenceScore,
   confidence,match_status AS matchStatus,explanations,candidates,season,episode,proposed_rel AS proposedRel,error,
-  manual_correction AS manualCorrection,updated_at AS updatedAt
+  manual_correction AS manualCorrection,ai_assisted AS aiAssisted,auto_applied AS autoApplied,updated_at AS updatedAt
   FROM metadata_matches WHERE run_id=? AND inventory_id=?`).get(runId,inventoryId) as any;
  const updatedRun=db.prepare('SELECT * FROM metadata_match_runs WHERE id=?').get(runId);
- return {run:updatedRun,match:{...updated,manualCorrection:Boolean(updated.manualCorrection),explanations:JSON.parse(updated.explanations),candidates:JSON.parse(updated.candidates)}};
+ return {run:updatedRun,match:{...updated,manualCorrection:Boolean(updated.manualCorrection),aiAssisted:Boolean(updated.aiAssisted),autoApplied:Boolean(updated.autoApplied),explanations:JSON.parse(updated.explanations),candidates:JSON.parse(updated.candidates)}};
 });
 
 const extraNames=/^(extras?|specials?|featurettes?|behind the scenes)$/i;
@@ -309,9 +329,66 @@ async function verifiedPath(rel:string){
  }
  return full;
 }
+async function moveWithoutOverwrite(src:string,dst:string){
+ await fs.link(src,dst);
+ try{await fs.unlink(src);}catch(error){
+  try{await fs.unlink(dst);}catch(cleanupError){
+   app.log.error({err:cleanupError,source:src,destination:dst},'Failed to remove an incomplete rename destination');
+   throw new Error('Could not remove the source after creating the destination, and destination cleanup also failed.');
+  }
+  throw error;
+ }
+}
+async function applyMetadataProposal(record:{inventoryId:string,rel:string,proposedRel:string,bytes:number}):Promise<{ok:boolean,inventoryId?:string,rel?:string,reason?:string}>{
+ if(!WRITE_ENABLED||!AUTO_APPLY_HIGH_CONFIDENCE)return {ok:false,reason:'Automatic matching writes are disabled.'};
+ const item=db.prepare('SELECT * FROM inventory WHERE id=?').get(record.inventoryId) as any;
+ if(!item||item.rel!==record.rel||item.bytes!==record.bytes)return {ok:false,reason:'The inventory entry changed; scan and match again.'};
+ if(!record.proposedRel.startsWith(`${item.category}/`)
+  ||path.posix.extname(record.proposedRel).toLowerCase()!==path.posix.extname(record.rel).toLowerCase()){
+  return {ok:false,reason:'The proposed destination does not preserve the media category and file type.'};
+ }
+ if(record.proposedRel===record.rel)return {ok:false,reason:'The file is already at the proposed path.'};
+ const src=await verifiedPath(record.rel),dst=await verifiedPath(record.proposedRel);
+ const stat=await fs.lstat(src);
+ if(!stat.isFile()||stat.isSymbolicLink())return {ok:false,reason:'Source is not a regular file.'};
+ if(stat.size!==record.bytes)return {ok:false,reason:'Source changed since scanning; scan again.'};
+ const siblings=await fs.readdir(path.dirname(src),{withFileTypes:true});
+ if(siblings.some(entry=>(entry.isFile()||entry.isSymbolicLink())&&subtitleExt.has(path.extname(entry.name).toLowerCase()))){
+  return {ok:false,reason:'A sidecar subtitle is present; automatic rename is blocked to keep it aligned with the video.'};
+ }
+ try{await fs.lstat(dst);return {ok:false,reason:'Destination already exists.'};}
+ catch(error:any){if(error.code!=='ENOENT')throw error;}
+ await fs.mkdir(path.dirname(dst),{recursive:true});
+ await verifiedPath(record.proposedRel);
+ await moveWithoutOverwrite(src,dst);
+
+ const newId=sha(record.proposedRel);
+ try{
+  db.transaction(()=>{
+   const update=db.prepare(`UPDATE inventory SET id=?,rel=?,issue=?,proposal=NULL,confidence='high',scanned_at=?
+    WHERE id=? AND rel=? AND bytes=?`).run(newId,record.proposedRel,'Automatically renamed by metadata matching',new Date().toISOString(),
+     record.inventoryId,record.rel,record.bytes);
+   if(update.changes!==1)throw new Error('Inventory entry changed before the automatic rename could be recorded.');
+   db.prepare(`INSERT INTO operations (old_rel,new_rel,status,created_at,inventory_retained)
+    VALUES (?,?,'applied',?,1)`).run(record.rel,record.proposedRel,new Date().toISOString());
+  })();
+ }catch(error){
+  try{
+   try{await fs.lstat(src);throw new Error('Original path is occupied; automatic rollback was not possible.');}
+   catch(checkError:any){if(checkError.code!=='ENOENT')throw checkError;}
+   await moveWithoutOverwrite(dst,src);
+  }catch(rollbackError){
+   app.log.error({err:rollbackError,source:record.rel,destination:record.proposedRel},'Failed to roll back automatic metadata rename');
+   throw new Error(`Metadata rename reached "${record.proposedRel}", but its database record failed and automatic rollback was unsuccessful.`);
+  }
+  throw error;
+ }
+ return {ok:true,inventoryId:newId,rel:record.proposedRel};
+}
 let scanning=false;
 let auditing=false;
 let quarantining=false;
+let metadataMatching=false;
 function updateAuditDuplicateSummary(runId:number){
  const summary=db.prepare(`SELECT COUNT(*) AS groups,COALESCE(SUM(file_count),0) AS files FROM (
   SELECT COUNT(*) AS file_count FROM file_audit_files WHERE run_id=? AND sha256 IS NOT NULL AND quarantined=0
@@ -322,7 +399,7 @@ function updateAuditDuplicateSummary(runId:number){
 }
 app.post('/api/audit/:id/quarantine',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; duplicate cleanup requires explicit write mode.',403);
- if(scanning||auditing||quarantining)return error(reply,'A library scan, audit, or file cleanup is already running.',409);
+ if(scanning||auditing||quarantining||metadataMatching)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
  const runId=Number(req.params?.id);
  if(!Number.isSafeInteger(runId)||runId<1)return error(reply,'Invalid file audit run id.');
  const run=db.prepare('SELECT status FROM file_audit_runs WHERE id=?').get(runId) as {status:string}|undefined;
@@ -409,7 +486,7 @@ app.post('/api/audit/:id/quarantine',{preHandler:[requireOrigin,requireAuth]},as
 });
 app.post('/api/quarantine/:id/restore',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled; restoring quarantined files requires explicit write mode.',403);
- if(scanning||auditing||quarantining)return error(reply,'A library scan, audit, or file cleanup is already running.',409);
+ if(scanning||auditing||quarantining||metadataMatching)return error(reply,'A library scan, audit, cleanup, or metadata matching run is already running.',409);
  const id=Number(req.params?.id);
  if(!Number.isSafeInteger(id)||id<1)return error(reply,'Invalid quarantine record id.');
  const item=db.prepare('SELECT * FROM file_quarantine WHERE id=?').get(id) as any;
@@ -442,7 +519,7 @@ app.post('/api/quarantine/:id/restore',{preHandler:[requireOrigin,requireAuth]},
  }finally{quarantining=false;}
 });
 app.post('/api/audit',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
- if(scanning||auditing||quarantining)return reply.code(409).send({error:'A library scan, audit, or file cleanup is already running.'});
+ if(scanning||auditing||quarantining||metadataMatching)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
  const startedAt=new Date().toISOString();
  const info=db.prepare("INSERT INTO file_audit_runs (status,started_at) VALUES ('queued',?)").run(startedAt);
  const runId=Number(info.lastInsertRowid);
@@ -489,7 +566,7 @@ app.get('/api/quarantine',{preHandler:requireAuth},async()=>({
   ORDER BY id DESC`).all(),
 }));
 app.post('/api/scan',{preHandler:[requireOrigin,requireAuth]},async(_req,reply)=>{
- if(scanning||auditing||quarantining)return reply.code(409).send({error:'A library scan, audit, or file cleanup is already running.'});
+ if(scanning||auditing||quarantining||metadataMatching)return reply.code(409).send({error:'A library scan, audit, cleanup, or metadata matching run is already running.'});
  scanning=true;
  try{
   const rows:Array<{id:string,rel:string,bytes:number,category:string,issue:string,proposal:string|null,confidence:string,scanned_at:string}>=[];
@@ -519,6 +596,7 @@ app.get('/api/operations',{preHandler:requireAuth},async()=>({items:db.prepare('
 function error(reply:any,msg:string,status=400){return reply.code(status).send({error:msg});}
 app.post('/api/apply',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled',403);
+ if(metadataMatching)return error(reply,'Wait for metadata matching to finish before applying a rename.',409);
  const {id,expectedProposal}=req.body||{};
  if(typeof id!=='string'||typeof expectedProposal!=='string')return error(reply,'Invalid request');
  const item=db.prepare('SELECT * FROM inventory WHERE id=?').get(id) as any;
@@ -531,8 +609,7 @@ app.post('/api/apply',{preHandler:[requireOrigin,requireAuth]},async(req:any,rep
   await fs.mkdir(path.dirname(dst),{recursive:true});
   await verifiedPath(item.proposal);
   // Exclusive hard-link then unlink avoids overwriting an existing destination.
-  await fs.link(src,dst);
-  try{await fs.unlink(src);}catch(e){await fs.unlink(dst).catch(()=>{});throw e;}
+  await moveWithoutOverwrite(src,dst);
   const info=db.prepare('INSERT INTO operations (old_rel,new_rel,status,created_at) VALUES (?,?,?,?)').run(item.rel,item.proposal,'applied',new Date().toISOString());
   db.prepare('DELETE FROM inventory WHERE id=?').run(id);
   return {ok:true,operationId:info.lastInsertRowid};
@@ -540,6 +617,7 @@ app.post('/api/apply',{preHandler:[requireOrigin,requireAuth]},async(req:any,rep
 });
 app.post('/api/undo',{preHandler:[requireOrigin,requireAuth]},async(req:any,reply)=>{
  if(!WRITE_ENABLED)return error(reply,'Write mode is disabled',403);
+ if(metadataMatching)return error(reply,'Wait for metadata matching to finish before undoing a rename.',409);
  const id=req.body?.id;
  if(!Number.isSafeInteger(id))return error(reply,'Invalid operation id');
  const op=db.prepare('SELECT * FROM operations WHERE id=?').get(id) as any;
@@ -549,9 +627,29 @@ app.post('/api/undo',{preHandler:[requireOrigin,requireAuth]},async(req:any,repl
   const st=await fs.lstat(src);if(!st.isFile())return error(reply,'Renamed file is missing',409);
   try{await fs.lstat(dst);return error(reply,'Original path is occupied',409);}catch(e:any){if(e.code!=='ENOENT')throw e;}
   await fs.mkdir(path.dirname(dst),{recursive:true});await verifiedPath(op.old_rel);
-  await fs.link(src,dst);
-  try{await fs.unlink(src);}catch(e){await fs.unlink(dst).catch(()=>{});throw e;}
-  db.prepare('UPDATE operations SET status=?,undone_at=? WHERE id=?').run('undone',new Date().toISOString(),id);
+  await moveWithoutOverwrite(src,dst);
+  try{
+   db.transaction(()=>{
+    if(op.inventory_retained){
+     const suggestion=suggest(op.old_rel);
+     const restored=db.prepare(`UPDATE inventory SET id=?,rel=?,issue=?,proposal=?,confidence=?,scanned_at=?
+      WHERE id=? AND rel=?`).run(sha(op.old_rel),op.old_rel,suggestion.issue,suggestion.proposal,suggestion.confidence,
+       new Date().toISOString(),sha(op.new_rel),op.new_rel);
+     if(restored.changes!==1)throw new Error('The retained inventory entry is missing; rescan is required before this operation can be recorded as undone.');
+    }
+    db.prepare('UPDATE operations SET status=?,undone_at=? WHERE id=?').run('undone',new Date().toISOString(),id);
+   })();
+  }catch(error){
+   try{
+    try{await fs.lstat(src);throw new Error('Renamed path is occupied; automatic rollback was not possible.');}
+    catch(checkError:any){if(checkError.code!=='ENOENT')throw checkError;}
+    await moveWithoutOverwrite(dst,src);
+   }catch(rollbackError){
+    req.log.error({err:rollbackError,id,source:op.old_rel,destination:op.new_rel},'Failed to roll back an incomplete undo');
+    throw new Error('Undo changed the media path, but its database update failed and automatic rollback was unsuccessful.');
+   }
+   throw error;
+  }
   return {ok:true};
  }catch(e:any){req.log.error(e);return error(reply,`Undo failed: ${e.code||e.message}`,409);}
 });

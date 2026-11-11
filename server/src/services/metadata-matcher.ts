@@ -16,11 +16,26 @@ interface InventoryRow {
   id: string;
   rel: string;
   category: string;
+  bytes: number;
 }
 
 interface MatchRun {
   id: number;
 }
+
+interface AutoApplyResult {
+  ok: boolean;
+  inventoryId?: string;
+  rel?: string;
+  reason?: string;
+}
+
+type AutoApply = (record: {
+  inventoryId: string;
+  rel: string;
+  proposedRel: string;
+  bytes: number;
+}) => Promise<AutoApplyResult>;
 
 interface MetadataCorrection {
   rel: string;
@@ -45,12 +60,13 @@ export class MetadataMatcher {
     private readonly db: Database.Database,
     token: string,
     private readonly aiClient: LmStudioClient | null = null,
+    private readonly autoApply: AutoApply | null = null,
   ) {
     this.client = new TmdbClient(db, token);
   }
 
   async run(runId: number): Promise<void> {
-    const rows = this.db.prepare('SELECT id,rel,category FROM inventory ORDER BY category,rel').all() as InventoryRow[];
+    const rows = this.db.prepare('SELECT id,rel,category,bytes FROM inventory ORDER BY category,rel').all() as InventoryRow[];
     const run = this.db.prepare('SELECT * FROM metadata_match_runs WHERE id=?').get(runId) as MatchRun | undefined;
     if (!run) throw new Error(`Metadata run ${runId} was not found.`);
     this.db.prepare("UPDATE metadata_match_runs SET status='running',total=? WHERE id=?").run(rows.length, runId);
@@ -78,6 +94,35 @@ export class MetadataMatcher {
           candidates: [],
           explanations: [`Metadata lookup failed: ${message}`],
         }, undefined, message);
+      }
+
+      if (this.autoApply
+        && result.matchStatus === 'matched'
+        && result.confidence === 'high'
+        && !result.aiAssisted
+        && !result.manualCorrection
+        && result.proposedRel
+        && result.proposedRel !== result.rel) {
+        try {
+          const outcome = await this.autoApply({
+            inventoryId: result.inventoryId,
+            rel: result.rel,
+            proposedRel: result.proposedRel,
+            bytes: row.bytes,
+          });
+          if (outcome.ok && outcome.inventoryId && outcome.rel) {
+            result.inventoryId = outcome.inventoryId;
+            result.rel = outcome.rel;
+            result.proposedRel = null;
+            result.autoApplied = true;
+            result.explanations.push(`Automatically renamed to "${outcome.rel}" because the deterministic match was high confidence.`);
+          } else {
+            result.explanations.push(`Automatic rename skipped: ${outcome.reason || 'The file could not be safely renamed.'}`);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unknown automatic rename error.';
+          result.explanations.push(`Automatic rename failed: ${message}`);
+        }
       }
 
       if (result.matchStatus === 'matched') matched++;
@@ -329,6 +374,7 @@ export class MetadataMatcher {
       candidates,
       score: 100,
       confidence: 'high',
+      aiAssisted: false,
       explanations: ['This provider match and correction were manually selected and saved for reuse.'],
     }, mapping.proposal, undefined, mapping.episodeTitle);
     record.title = correction.corrected_title;
@@ -353,7 +399,7 @@ export class MetadataMatcher {
   private makeRecord(
     row: InventoryRow,
     parsed: ParsedMedia,
-    scored: { candidate?: MetadataCandidate; candidates: MetadataCandidate[]; score: number; confidence: Confidence; explanations: string[] },
+    scored: { candidate?: MetadataCandidate; candidates: MetadataCandidate[]; score: number; confidence: Confidence; aiAssisted?: boolean; explanations: string[] },
     proposedRel?: string,
     error?: string,
     episodeTitle?: string,
@@ -374,6 +420,8 @@ export class MetadataMatcher {
       episodeTitle: episodeTitle ?? null,
       confidenceScore: scored.score,
       confidence: scored.confidence,
+      aiAssisted: scored.aiAssisted ?? false,
+      autoApplied: false,
       matchStatus,
       explanations: scored.explanations,
       candidates: scored.candidates,
@@ -389,13 +437,15 @@ export class MetadataMatcher {
   private saveRecord(runId: number, record: ReturnType<typeof this.makeRecord>): void {
     this.db.prepare(`INSERT OR REPLACE INTO metadata_matches
       (run_id,inventory_id,rel,provider_id,provider_type,title,original_title,release_year,confidence_score,confidence,
-       episode_title,match_status,explanations,candidates,season,episode,proposed_rel,error,manual_correction,updated_at)
+       episode_title,match_status,explanations,candidates,season,episode,proposed_rel,error,manual_correction,ai_assisted,auto_applied,updated_at)
       VALUES (@runId,@inventoryId,@rel,@providerId,@providerType,@title,@originalTitle,@releaseYear,@confidenceScore,@confidence,
-       @episodeTitle,@matchStatus,@explanations,@candidates,@season,@episode,@proposedRel,@error,@manualCorrection,@updatedAt)`)
+       @episodeTitle,@matchStatus,@explanations,@candidates,@season,@episode,@proposedRel,@error,@manualCorrection,@aiAssisted,@autoApplied,@updatedAt)`)
       .run({
         runId,
         ...record,
         manualCorrection: record.manualCorrection ? 1 : 0,
+        aiAssisted: record.aiAssisted ? 1 : 0,
+        autoApplied: record.autoApplied ? 1 : 0,
         explanations: JSON.stringify(record.explanations),
         candidates: JSON.stringify(record.candidates),
       });

@@ -65,7 +65,17 @@ test('keeps AI-assisted title matches in review instead of assigning high confid
     id: 1, mediaType: 'movie', title: 'Example', originalTitle: 'Example', year: 2020, aliases: [],
   }], ['Example']);
   assert.equal(result.confidence, 'medium');
-  assert.ok(result.explanations.some(explanation => explanation.includes('AI-suggested title')));
+  assert.equal(result.aiAssisted, true);
+  assert.ok(result.explanations.some(explanation => explanation.includes('LM Studio supplied')));
+});
+
+test('keeps matches in review whenever an alternate AI search title was used', () => {
+  const parsed = parseMediaPath('movies/Movies/Example (2020)/movie.mkv', 'movies/Movies');
+  const result = scoreCandidates(parsed, [{
+    id: 1, mediaType: 'movie', title: 'Example', originalTitle: 'Example', year: 2020, aliases: [],
+  }], ['Unrelated suggestion']);
+  assert.equal(result.confidence, 'medium');
+  assert.equal(result.aiAssisted, true);
 });
 
 test('keeps absolute episode numbering for review instead of inventing a season', () => {

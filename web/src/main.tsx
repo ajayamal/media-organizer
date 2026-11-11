@@ -68,6 +68,8 @@ type MetadataMatch = {
   proposedRel: string | null;
   error: string | null;
   manualCorrection: boolean;
+  aiAssisted: boolean;
+  autoApplied: boolean;
   updatedAt: string;
 };
 
@@ -170,6 +172,7 @@ function App() {
   const [password, setPassword] = useState('');
   const [writes, setWrites] = useState(false);
   const [aiMatchingEnabled, setAiMatchingEnabled] = useState(false);
+  const [autoApplyHighConfidenceEnabled, setAutoApplyHighConfidenceEnabled] = useState(false);
   const [items, setItems] = useState<Item[]>([]);
   const [ops, setOps] = useState<Op[]>([]);
   const [query, setQuery] = useState('');
@@ -202,11 +205,12 @@ function App() {
   };
 
   useEffect(() => {
-    api<{ authenticated: boolean; writesEnabled: boolean; aiMatchingEnabled: boolean }>('/status')
+    api<{ authenticated: boolean; writesEnabled: boolean; aiMatchingEnabled: boolean; autoApplyHighConfidenceEnabled: boolean }>('/status')
       .then(status => {
         setAuthed(status.authenticated);
         setWrites(status.writesEnabled);
         setAiMatchingEnabled(status.aiMatchingEnabled);
+        setAutoApplyHighConfidenceEnabled(status.autoApplyHighConfidenceEnabled);
         if (status.authenticated) load().catch(error => setMsg(error.message));
       })
       .catch(error => setMsg(error.message));
@@ -233,6 +237,10 @@ function App() {
       window.clearInterval(interval);
     };
   }, [authed, matchRunId, matchRun?.status]);
+
+  useEffect(() => {
+    if (matchRun?.status === 'completed') load().catch(error => setMatchError(error.message));
+  }, [matchRun?.status]);
 
   useEffect(() => {
     if (!authed || auditRunId === null || auditReport?.run.status === 'completed' || auditReport?.run.status === 'failed') return;
@@ -502,7 +510,7 @@ function App() {
         <div className="aside-bottom">
           <div className="mode">
             <ShieldCheck size={17} />
-            <div><strong>{writes ? 'Write-enabled' : 'Read-only mode'}</strong><small>{writes ? 'Approvals required' : 'Media protected'}</small></div>
+            <div><strong>{writes ? 'Write-enabled' : 'Read-only mode'}</strong><small>{!writes ? 'Media protected' : autoApplyHighConfidenceEnabled ? 'High-confidence auto-apply enabled' : 'Approvals required'}</small></div>
           </div>
           <button className="logout" onClick={logout}><LogOut size={16} />Sign out</button>
         </div>
@@ -558,7 +566,7 @@ function App() {
                 </table>
                 {visible.length === 0 && <div className="empty">{items.length === 0 ? 'No files indexed yet. Click “Scan library” to begin.' : 'No files match your filters.'}</div>}
               </div>
-              <footer>{visible.length} matching files · No automatic changes</footer>
+              <footer>{visible.length} matching files · Library suggestions require approval</footer>
             </section>
           </>
         )}
@@ -575,6 +583,7 @@ function App() {
             progress={progress}
             error={matchError}
             aiMatchingEnabled={aiMatchingEnabled}
+            autoApplyHighConfidenceEnabled={autoApplyHighConfidenceEnabled}
             runId={matchRun?.id ?? null}
             onStart={startMatching}
             onFilter={setMatchFilter}
@@ -902,6 +911,7 @@ function auditStatusLabel(status: AuditRun['status']): string {
 function MetadataPanel({
   itemsCount,
   aiMatchingEnabled,
+  autoApplyHighConfidenceEnabled,
   matchRun,
   matchingActive,
   matchingBusy,
@@ -917,6 +927,7 @@ function MetadataPanel({
 }: {
   itemsCount: number;
   aiMatchingEnabled: boolean;
+  autoApplyHighConfidenceEnabled: boolean;
   matchRun: MatchRun | null;
   matchingActive: boolean;
   matchingBusy: boolean;
@@ -941,7 +952,9 @@ function MetadataPanel({
           <h2>Match your library with TMDB</h2>
           <p>TMDB supplies metadata and verifies standard episode numbers. {aiMatchingEnabled
             ? 'Local LM Studio AI suggests alternate search titles for uncertain matches; AI-assisted results remain in review.'
-            : 'Configure LM Studio to suggest alternate search titles for uncertain matches.'} Matching never renames or modifies media files.</p>
+            : 'Configure LM Studio to suggest alternate search titles for uncertain matches.'} {autoApplyHighConfidenceEnabled
+              ? 'Deterministic high-confidence matches will be renamed automatically; AI-assisted matches remain in review and manually corrected matches are never auto-renamed.'
+              : 'Matching does not rename files unless high-confidence auto-apply is explicitly enabled in the server configuration.'}</p>
         </div>
         <button className="primary" disabled={matchingActive || matchingBusy || itemsCount === 0} onClick={onStart}>
           <Sparkles size={16} />{matchingBusy ? 'Starting...' : matchingActive ? 'Matching...' : matchRun ? 'Run matching again' : 'Start matching'}
@@ -975,7 +988,9 @@ function MetadataPanel({
 
           <section className="panel metadata-results">
             <div className="panel-top metadata-results-top">
-              <div><h2>Match results</h2><p>Scores are heuristic, not probabilities. Review every proposed destination before acting.</p></div>
+              <div><h2>Match results</h2><p>Scores are heuristic, not probabilities. {autoApplyHighConfidenceEnabled
+                ? 'Only deterministic high-confidence matches are renamed automatically; AI-assisted matches remain in review.'
+                : 'Review proposed destinations before acting.'}</p></div>
               <select value={filter} onChange={event => onFilter(event.target.value as MatchFilter)} aria-label="Filter match confidence">
                 <option value="all">All results</option>
                 <option value="review">Review queue</option>
@@ -989,7 +1004,7 @@ function MetadataPanel({
             {matches.length === 0
               ? <div className="empty">{matchingActive ? 'Waiting for matching results...' : 'No results for this filter.'}</div>
               : <div className="match-groups">{groups.map(group => <MetadataGroupCard key={group.key} group={group} runId={runId} onSaveCorrection={onSaveCorrection} />)}</div>}
-            <footer>{matches.length} result(s) shown · Metadata matching is read-only</footer>
+            <footer>{matches.length} result(s) shown · {autoApplyHighConfidenceEnabled ? 'Automatic renames are journaled and undoable.' : 'No files changed by matching.'}</footer>
           </section>
         </>
       )}
@@ -1051,6 +1066,7 @@ function MetadataMatchRow({
       <div className="match-row-score">
         <ConfidencePill confidence={match.confidence} />
         <strong>{match.confidenceScore}/100</strong>
+        {match.autoApplied && <span className="manual-badge">Auto-renamed</span>}
         {match.manualCorrection && <span className="manual-badge">Verified by you</span>}
       </div>
       <details className="match-explanation">
